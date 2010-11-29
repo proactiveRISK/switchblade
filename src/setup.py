@@ -38,6 +38,7 @@ setup(
     data_files=[
       'interface.glade',
       '../build/src/http_dos_cli.exe',
-      '../license.txt'
+      '../license.txt',
+      'VERSION'
       ]
     )
