@@ -1,0 +1,16 @@
+# vim: set ft=python :
+
+Import('env')
+
+env.Append(LIBS=['event'],
+           CXXFLAGS=['-g', '-O1'])
+
+if env['PLATFORM'] == 'win32':
+  env.Append(
+      LIBS=['dnsapi', 'ws2_32'],
+      LINKFLAGS=['-static-libgcc', '-static-libstdc++'])
+else:
+  env.Append(LIBS=['rt'])
+
+env.Program('http_dos_cli', ['main.cc'])
+
