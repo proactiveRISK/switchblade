@@ -40,6 +40,8 @@
 #include <sstream>
 #include <iostream>
 
+#include "version.h"
+
 // -------------------------------------------------------------------------
 // Socket support
 
@@ -723,11 +725,19 @@ void SlowHeadersHttpConnection::send_next_post_part()
 
 // -------------------------------------------------------------------------
 
-void usage()
+void version()
 {
   std::cout <<
 "HTTP load tester for slow headers and slow POST attacks.\n"
-"Version: 1.1\n"
+"  Version: " << VERSION_MAJOR << "." << VERSION_MINOR << "\n"
+"  URL: http://code.google.com/p/owasp-dos-http-post/\n";
+}
+
+
+void usage()
+{
+  version();
+  std::cout <<
 "Usage:\n"
 "  --host <dns_name_of_webserver>\n"
 "      Web server to connect to (just DNS, no URI). Defaults to localhost.\n"
@@ -832,13 +842,14 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "proxy-port", 1, 0, OPT_PROXY_PORT },
     { "seed", 1, 0, OPT_SEED },
     { "help", 0, 0, 'h' },
+    { "version", 0, 0, 'v' },
     { 0, 0, 0, 0 }
   };
 
   while (1) {
     int option_index = 0;
 
-    int c = getopt_long(argc, argv, "h", long_options, &option_index);
+    int c = getopt_long(argc, argv, "hv", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -853,6 +864,10 @@ void parse_options(Options* opts, int argc, char* argv[])
   switch (c) {
     case 'h':
       usage();
+      exit(EXIT_SUCCESS);
+
+    case 'v':
+      version();
       exit(EXIT_SUCCESS);
 
     case OPT_SEED:
