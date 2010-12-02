@@ -185,6 +185,14 @@ class GUI(object):
     self.max_connections_active = 0
     self.max_connections_startup_fail = 0
     self.cli_end_lock = threading.Lock()
+    self.version = 0.0
+
+    try:
+      f = open('VERSION')
+      self.version = float(f.readline().strip())
+      f.close()
+    except:
+      pass
 
     builder = gtk.Builder()
     builder.add_from_file('interface.glade')
@@ -194,6 +202,9 @@ class GUI(object):
     # Main window
     self.window = builder.get_object('main_window')
     self.window.connect('delete-event', gtk.main_quit)
+    self.window.set_title(
+        'HTTP attack version %3.1f (slow headers and slow POST)' %
+        self.version)
 
     self.quit_button = builder.get_object('quit_button')
     self.quit_button.connect('clicked', gtk.main_quit)
