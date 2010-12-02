@@ -20,6 +20,8 @@ cp -r "${gtk_dir}/share/themes/MS-Windows/" dist/share/themes/Default
 cp -r "${gtk_dir}/share/locale/en_GB"   dist/share/locale
 cp -r "${gtk_dir}/share/locale/en_CA"   dist/share/locale
 
+VERSION=$(cat VERSION)
+
 mv dist HttpDosTool
-zip -r -9 HttpDosTool3.zip HttpDosTool/
+zip -r -9 HttpDosTool${VERSION}.zip HttpDosTool/
 
