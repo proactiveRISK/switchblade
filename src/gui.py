@@ -30,7 +30,10 @@ import urlparse
 import time
 
 if sys.platform == 'win32':
+  import msvcrt
+  import pywintypes
   import win32process
+  import win32pipe
 else:
   import fcntl
   import select
@@ -162,7 +165,15 @@ class CliHandler(object):
   def _poll_stdout_win32(self):
     fn = self.process.stdout.fileno()
     handle = msvcrt.get_osfhandle(fn)
-    _, bytes_available, _ = win32pipe.PeekNamedPipe(handle, 0)
+    try:
+      _, bytes_available, _ = win32pipe.PeekNamedPipe(handle, 0)
+    except pywintypes.error, e:
+      try:
+        self.process.kill()
+      except:
+        pass
+      self._finished()
+      bytes_available = 0
     return bytes_available
 
   def start_process(self):
