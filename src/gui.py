@@ -28,25 +28,37 @@ import subprocess
 import sys
 import urlparse
 import time
-import threading
 
 if sys.platform == 'win32':
   import win32process
+else:
+  import fcntl
+  import select
 
 def win32_link_button_handler(button, uri):
   os.startfile(uri)
 
 # ----------------------------------------------------------------------------
-def cli_thread_main(gui, attack_info, end_lock):
-  
-  def parse_line(line):
+class CliHandler(object):
+
+  def __init__(self, gui, attack_info):
+    self.gui = gui
+    self.attack_info = attack_info
+    self.buf = ''
+
+    if sys.platform == 'win32':
+      self._poll_stdout = self._poll_stdout_win32
+    else:
+      self._poll_stdout = self._poll_stdout_unix
+
+  def _parse_line(self, line):
     if line.startswith('CONNECTIONS:'):
       try:
         fields = line.strip().split(' ')
         (target, started, active, connected, error, startup_fail) = [
             int(x) for x in fields if x.isdigit()]
 
-        gobject.idle_add(gui.cli_thread_connection_info,
+        gobject.idle_add(self.gui.cli_connection_info,
             (target, started, active, connected, error, startup_fail))
       except Exception, e:
         print 'Internal error:', str(e), line.strip()
@@ -58,18 +70,12 @@ def cli_thread_main(gui, attack_info, end_lock):
           line.startswith('EVENT_CONNECTING:') or
           line.startswith('EVENT_CONNECTED:') or
           line.startswith('EVENT_DISCONNECTED:')):
-      gobject.idle_add(gui.cli_thread_diag_line, line.strip())
+      gobject.idle_add(self.gui.cli_diag_line, line.strip())
     else:
       # Unknown. Nothing sensible to do here, really?
       pass
 
-  def check_end():
-    end_lock.acquire()
-    end = gui.cli_thread_should_end
-    end_lock.release()
-    return end
-
-  def build_cmd_line():
+  def _build_cmd_line(self):
     c = [] 
     for exe_location in ['.', '../build/src', 'build/src']:
       exe_name = os.path.join(exe_location, 'http_dos_cli')
@@ -82,6 +88,8 @@ def cli_thread_main(gui, attack_info, end_lock):
 
     if len(c) == 0:
       raise Exception('Cannot find location of http_dos_cli application.')      
+
+    attack_info = self.attack_info
 
     # Update the GUI 4 times every second.
     c.append('--report-interval=0.250')
@@ -134,43 +142,89 @@ def cli_thread_main(gui, attack_info, end_lock):
 
     return c
 
-  try:
-    popen_args = {
-        'stdin': open(os.devnull, 'w'),
-        'stdout': subprocess.PIPE,
-        'stderr': subprocess.STDOUT,
-        'bufsize': 1
-        }
-    if sys.platform == 'win32':
-      popen_args.update({'creationflags': win32process.CREATE_NO_WINDOW})
-
-    process = subprocess.Popen(build_cmd_line(), **popen_args)
-
-    # Just check that we've started OK
-    if process.poll():
-      raise Exception('Process gone away?')
-
-    while True:
-      if check_end():
-        break
-
-      line = process.stdout.readline()
-      if not line:
-        # EOF
-        break
-      parse_line(line)
-      #print 'got line', line
-
+  def _finished(self):
     try:
-      process.kill()
+      self.process.wait()
     except:
       pass
 
-    process.wait()
-    gobject.idle_add(gui.cli_thread_has_finished, ())
-  except Exception, e:
-    gobject.idle_add(gui.cli_thread_has_finished, ())
-    gobject.idle_add(gui.cli_thread_error, str(e))
+    gobject.idle_add(self.gui.cli_has_finished, ())
+
+  def _poll_stdout_unix(self):
+    rlist, wlist, xlist = select.select([self.process.stdout.fileno()], [], [], 0.0)
+    if rlist:
+      # This is a fake value, we just want to read as much data as possible.
+      # It is fine to return any large number, because the file descriptor we
+      # read from is non-blocking.
+      return 1000
+    return 0
+
+  def _poll_stdout_win32(self):
+    fn = self.process.stdout.fileno()
+    handle = msvcrt.get_osfhandle(fn)
+    _, bytes_available, _ = win32pipe.PeekNamedPipe(handle, 0)
+    return bytes_available
+
+  def start_process(self):
+    try:
+      popen_args = {
+          'stdin': open(os.devnull, 'w'),
+          'stdout': subprocess.PIPE,
+          'stderr': subprocess.STDOUT,
+          'bufsize': 1
+          }
+      if sys.platform == 'win32':
+        popen_args.update({'creationflags': win32process.CREATE_NO_WINDOW})
+
+      self.process = subprocess.Popen(self._build_cmd_line(), **popen_args)
+
+      if sys.platform != 'win32':
+        fcntl.fcntl(self.process.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
+
+      # Just check that we've started OK
+      if self.process.poll():
+        raise Exception('Process gone away?')
+    except Exception, e:
+      self._finished()
+      gobject.idle_add(gui.cli_thread_error, str(e))
+
+  def finish_process(self):
+    try:
+      self.process.kill()
+    except:
+      pass
+
+    self._finished()
+
+  def poll_process(self):
+    try:
+      if self.process.poll():
+        self._finished()
+        return
+
+      bytes_avail = self._poll_stdout()
+
+      if bytes_avail == 0:
+        return
+
+      bytes_read = os.read(self.process.stdout.fileno(), bytes_avail)
+
+      if len(bytes_read) == 0:
+        self._finished()
+        return
+
+      self.buf += bytes_read
+
+      while True:
+        idx = self.buf.find('\n')
+        if idx == -1:
+          break
+        line, self.buf = self.buf[:idx + 1], self.buf[idx + 1:]
+        self._parse_line(line)
+
+    except Exception, e:
+      self._finished()
+      gobject.idle_add(self.gui.cli_thread_error, str(e))
 
 # ----------------------------------------------------------------------------
 # GUI
@@ -181,10 +235,9 @@ class GUI(object):
 
   def __init__(self):
     self.attack_info = {}
-    self.cli_thread = None
+    self.cli = None
     self.max_connections_active = 0
     self.max_connections_startup_fail = 0
-    self.cli_end_lock = threading.Lock()
     self.version = 0.0
 
     try:
@@ -445,13 +498,18 @@ class GUI(object):
   def start_cli_thread(self):
     self.max_connections_active = 0
     self.max_connections_startup_fail = 0
-    self.cli_thread_should_end = False
-    self.cli_thread = threading.Thread(target=cli_thread_main,
-        name='CLI controller thread',
-        args=(self, self.attack_info, self.cli_end_lock))
-    self.cli_thread.start()
+    self.cli = CliHandler(self, self.attack_info)
+    self.cli.start_process()
+    gobject.timeout_add(300, self.poll_cli_thread)
 
-  def cli_thread_connection_info(self, info):
+  def poll_cli_thread(self):
+    if not self.cli:
+      return
+
+    self.cli.poll_process()
+    gobject.timeout_add(300, self.poll_cli_thread)
+
+  def cli_connection_info(self, info):
     (target, started, active, connected, error, startup_fail) = info
 
     self.max_connections_active = max(self.max_connections_active,
@@ -465,9 +523,8 @@ class GUI(object):
     self.attack_dialog_disconnected_connections_label.set_text(str(error))
     self.attack_dialog_create_error_connections_label.set_text(str(startup_fail))
 
-  def cli_thread_has_finished(self, arg):
-    self.cli_thread.join()
-    self.cli_thread = None
+  def cli_has_finished(self, arg):
+    self.cli = None
     self.attack_dialog_cancel_button.set_label('OK')
 
     text_buf = self.attack_dialog_diagnostics_textview.get_buffer()
@@ -500,7 +557,7 @@ class GUI(object):
   def cli_thread_error(self, e):
     self.show_error_dialog('Running attack program failed: ' + str(e))
 
-  def cli_thread_diag_line(self, line):
+  def cli_diag_line(self, line):
     text_buf = self.attack_dialog_diagnostics_textview.get_buffer()
     tb_iter = text_buf.get_end_iter()
 
@@ -529,7 +586,7 @@ class GUI(object):
 
   def on_run_attack_button_clicked(self, widget, data=None):
     # Need to wait for the CLI thread to finish :(
-    if self.cli_thread:
+    if self.cli:
       return
 
     try:
@@ -564,9 +621,8 @@ class GUI(object):
 
     self.attack_dialog.hide()
 
-    self.cli_end_lock.acquire()
-    self.cli_thread_should_end = True
-    self.cli_end_lock.release()
+    if self.cli:
+      self.cli.finish_process()
     
   def on_attack_type_combobox_changed(self, widget):
     self.update_attack_specific_parameters()
@@ -579,6 +635,5 @@ class GUI(object):
 
 
 if __name__ == '__main__':
-  gtk.gdk.threads_init()
   gui = GUI()
   gtk.main()
