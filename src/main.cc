@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -152,6 +153,7 @@ struct Options {
   std::string   proxy_;
   uint32_t      proxy_addr_;   // Network byte order
   uint16_t      proxy_port_;   // Network byte order
+  bool          stay_open_;
 
   Options()
     : host_("localhost"),
@@ -176,7 +178,8 @@ struct Options {
       random_timeout_(false),
       proxy_(),
       proxy_addr_(0),
-      proxy_port_(htons(80))
+      proxy_port_(htons(80)),
+      stay_open_(false)
     {}
 };
 
@@ -815,7 +818,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     OPT_RANDOM_PATH, OPT_LOG_CONNECTION, OPT_POST_CONTENT_LENGTH,
     OPT_PATH, OPT_REPORT_INTERVAL, OPT_RANDOM_PAYLOAD,
     OPT_RANDOM_POST_CONTENT_LENGTH, OPT_RANDOM_TIMEOUT, OPT_SEED,
-    OPT_USER_AGENT, OPT_POST_FIELD, OPT_PROXY, OPT_PROXY_PORT,
+    OPT_USER_AGENT, OPT_POST_FIELD, OPT_PROXY, OPT_PROXY_PORT, OPT_STAY_OPEN,
     OPT_HELP
   };
 
@@ -841,6 +844,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "proxy", 1, 0, OPT_PROXY },
     { "proxy-port", 1, 0, OPT_PROXY_PORT },
     { "seed", 1, 0, OPT_SEED },
+    { "stay-open", 0, 0, OPT_STAY_OPEN },
     { "help", 0, 0, 'h' },
     { "version", 0, 0, 'v' },
     { 0, 0, 0, 0 }
@@ -894,6 +898,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     STRING_ARG(OPT_POST_FIELD, post_field_);
     HOST_ARG(OPT_PROXY, proxy_, proxy_addr_);
     GENERIC_ARG(OPT_PROXY_PORT, proxy_port_, htons(atoi(optarg)));
+    BOOL_ARG(OPT_STAY_OPEN, stay_open_);
 
 #undef HOST_ARG
 #undef STRING_ARG
@@ -923,14 +928,14 @@ void run(const Options& opts)
   event_base_loop(controller.get_event_base(), 0);
 
   controller.report();
-  std::cout << "FINISHED." << std::endl;
 }
 
 int main(int argc, char* argv[])
 {
-  try {
-    Options opts;
+  int error_code = 0;
+  Options opts;
 
+  try {
     parse_options(&opts, argc, argv);
 
     SocketSetupGuard sock_guard;
@@ -938,12 +943,26 @@ int main(int argc, char* argv[])
 
     run(opts);
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Caught fatal exception: " << e.what() << std::endl;
-    return 1;
+    std::cout << "ERROR: " << e.what() << std::endl;
+    error_code = 1;
   } catch (...) {
-    std::cerr << "ERROR: Caught unknown exception." << std::endl;
-    return 2;
+    std::cout << "ERROR: Caught unknown exception." << std::endl;
+    error_code = 2;
   }
 
-  return 0;
+  std::cout << "FINISHED." << std::endl;
+
+  // Just a hack to make sure the application stays open long enough for the
+  // GUI application to read error messages. If we exit too early, we can no
+  // longer read from the pipe, so the error messages or indeed, anything in
+  // the pipe disappears into the ether.
+  if (opts.stay_open_) {
+#ifdef PLAT_WIN32
+    ::Sleep(20 * 1000);
+#else
+    ::sleep(20);
+#endif
+  }
+
+  return error_code;
 }

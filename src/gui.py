@@ -66,13 +66,13 @@ class CliHandler(object):
       except Exception, e:
         print 'Internal error:', str(e), line.strip()
     elif line.startswith('FINISHED'):
-      # This will be handled later
-      pass
+      self.finish_process()
     elif (line.startswith('WRITE:') or
           line.startswith('READ:') or
           line.startswith('EVENT_CONNECTING:') or
           line.startswith('EVENT_CONNECTED:') or
-          line.startswith('EVENT_DISCONNECTED:')):
+          line.startswith('EVENT_DISCONNECTED:') or
+          line.startswith('ERROR:')):
       gobject.idle_add(self.gui.cli_diag_line, line.strip())
     else:
       # Unknown. Nothing sensible to do here, really?
@@ -91,6 +91,13 @@ class CliHandler(object):
 
     if len(c) == 0:
       raise Exception('Cannot find location of http_dos_cli application.')      
+
+    # Hack for windows, we want to ensure the application stays around so we
+    # can read from the pipe. This needs to be specified before the '--host'
+    # option, else it wont be set until after e.g. a DNS query is done, which
+    # can fail.
+    if sys.platform == 'win32':
+      c.append('--stay-open')
 
     attack_info = self.attack_info
 
@@ -589,6 +596,9 @@ class GUI(object):
         text_buf.insert(tb_iter, 'Disconnected.\n')
       elif line.startswith('EVENT_CONNECTING:'):
         text_buf.insert(tb_iter, 'Connecting to %s ... ' % line.split()[1])
+      elif line.startswith('ERROR:'):
+        text_buf.insert_with_tags_by_name(tb_iter,
+            'Error: ' + line[7:].strip() + '\n', 'bold-wrap')
 
     gobject.idle_add(gui.scroll_diagnostics_textview, ())
 
@@ -621,7 +631,7 @@ class GUI(object):
     if self.attack_info['diagnostics']:
       text_buf.set_text('Following connection 1...\n')
     else:
-      text_buf.set_text('Diagnostics not enabled.')
+      text_buf.set_text('Diagnostics not enabled.\n')
     self.attack_dialog_diagnostics_textview.set_size_request(-1, 100)
 
     self.attack_dialog_cancel_button.set_label('Cancel attack')
