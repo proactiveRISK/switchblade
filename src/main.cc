@@ -121,9 +121,9 @@ void throw_ssl_conn_error(SSL *ssl, int ret)
   int ssl_err = SSL_get_error(ssl, ret);
 
   if (ssl_err == SSL_ERROR_SSL)
-    throw_ssl_error("SSL connection error");
+    throw_ssl_error("SSL connection error (ssl)");
   if (ssl_err == SSL_ERROR_SYSCALL) {
-    throw_socket_error("SSL connection error");
+    throw_socket_error("SSL connection error (syscall)");
   }
 
   std::ostringstream oss;
@@ -395,7 +395,8 @@ private:
   enum {
     STATE_TCP_CONNECTING,
     STATE_SSL_CONNECTING,
-    STATE_SSL_CONNECTED
+    STATE_SSL_CONNECTED,
+    STATE_SSL_RENEGOTIATING
   }                             state_;
 
   static SSL_CTX*               ctx_;
@@ -409,6 +410,7 @@ private:
   void tcp_connected();
   void ssl_connected();
   void ssl_connect();
+  void ssl_handshake();
 };
 
 void BufferEventHandler::buf_event_read_cb(struct bufferevent* be, void* arg)
@@ -880,7 +882,7 @@ void SslConnection::init_once()
   if (!ctx_)
     throw_ssl_error("SSL_CTX_new failed");
 
-#if 0
+#if 1
   SSL_CTX_set_options(ctx_, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
   SSL_CTX_set_options(ctx_, SSL_OP_LEGACY_SERVER_CONNECT);
 
@@ -897,6 +899,16 @@ void SslConnection::event_read()
       break;
     case STATE_SSL_CONNECTING:
       ssl_connect();
+    case STATE_SSL_CONNECTED:
+    {
+      char buf[1024];
+      while (SSL_read(ssl_, buf, sizeof(buf)) > 0)
+        ;
+      break;
+    }
+    case STATE_SSL_RENEGOTIATING:
+      ssl_handshake();
+      break;
     default:
       assert(0);
       break;
@@ -912,7 +924,10 @@ void SslConnection::event_write()
     case STATE_SSL_CONNECTING:
       ssl_connect();
     case STATE_SSL_CONNECTED:
-      std::cout << "ssl-connected: write" << std::endl;
+      // std::cout << "ssl-connected: write" << std::endl;
+      break;
+    case STATE_SSL_RENEGOTIATING:
+      ssl_handshake();
       break;
     default:
       assert(0);
@@ -935,13 +950,12 @@ void SslConnection::timer_event()
   switch (state_) {
   case STATE_SSL_CONNECTED:
   {
+    state_ = STATE_SSL_RENEGOTIATING;
     std::cout << "SSL renegotiate" << std::endl;
     int ret = SSL_renegotiate(ssl_);
     if (ret != 1)
       throw_ssl_error("SSL_renegotiate");
-    ret = SSL_do_handshake(ssl_);
-    if (ret != 1)
-      throw_ssl_error("SSL_handshake");
+    ssl_handshake();
     break;
   }
   default:
@@ -991,6 +1005,37 @@ void SslConnection::ssl_connect()
     throw_ssl_conn_error(ssl_, ret);
   } else {
     throw std::runtime_error("Invalid return code");
+  }
+}
+
+void SslConnection::ssl_handshake()
+{
+  int ret = SSL_do_handshake(ssl_);
+  if (ret < 0) {
+    int ssl_err = SSL_get_error(ssl_, ret);
+
+    // Non-blocking, just need to keep polling connect
+    if (ssl_err == SSL_ERROR_WANT_READ ||
+        ssl_err == SSL_ERROR_WANT_WRITE)
+      return;
+
+    throw_ssl_conn_error(ssl_, ret);
+  } else if (ret != 1) {
+    // This must mean renegotiate isn't supported. But OpenSSL doesn't give
+    // us any error info?
+    std::cout << "SSL_do_handshake failed" << std::endl;
+    throw_ssl_conn_error(ssl_, ret);
+  }
+
+  assert(SSL_renegotiate_pending(ssl_) == 0);
+
+  // std::cout << "SSL_renegotiate finished" << std::endl;
+
+  if (1) {
+    int ret = SSL_renegotiate(ssl_);
+    if (ret != 1)
+      throw_ssl_error("SSL_renegotiate");
+    ssl_handshake();
   }
 }
 
