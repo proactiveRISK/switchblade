@@ -173,7 +173,7 @@ struct Options {
   uint16_t      host_port_;   // Network byte order
   std::string   user_agent_;
   enum {
-    RUN_SLOW_HEADERS, RUN_SLOW_POST 
+    RUN_SLOW_HEADERS, RUN_SLOW_POST, RUN_SSL_RENEG
   }             run_;
   int           connections_;
   int           rate_;
@@ -310,20 +310,26 @@ uint32_t dns_resolve(const std::string& str)
 
 class SlowHeadersHttpConnection;
 
+struct Connection {
+  virtual bool get_logging() = 0;
+  virtual bool get_connected() = 0;
+  virtual ~Connection() {}
+};
+
 class Controller {
 public:
   explicit Controller(const Options& opts);
 
   void report();
   void start_next_connection(void);
-  void report_connection_error(class SlowHeadersHttpConnection* c);
-  void report_connected(class SlowHeadersHttpConnection* c);
+  void report_connection_error(class Connection* c);
+  void report_connected(class Connection* c);
 
   const Options& get_options() const { return opts_; }
   struct event_base* get_event_base() const { return event_base_; }
 
 private:
-  typedef std::set<class SlowHeadersHttpConnection*> ConnectionSet;
+  typedef std::set<class Connection*> ConnectionSet;
 
   static void report_cb(int fd, short what, void* arg);
   static void start_next_connection_cb(int fd, short what, void* arg);
@@ -350,14 +356,12 @@ struct BufferEventHandler {
   virtual void event_event(int what) = 0;
 };
 
-class SlowHeadersHttpConnection : public BufferEventHandler {
+class SlowHeadersHttpConnection : public BufferEventHandler, public Connection {
 public:
   SlowHeadersHttpConnection(Controller&, bool log);
 
-  void send_partial_get_header();
-  void send_post_header();
-  bool get_logging() const { return logging_; }
-  bool get_connected() const { return connected_; }
+  virtual bool get_logging() { return logging_; }
+  virtual bool get_connected() { return connected_; }
 
 private:
   Controller&                   controller_;
@@ -373,6 +377,8 @@ private:
   virtual void event_read();
   virtual void event_write();
   virtual void event_event(int what);
+  void send_partial_get_header();
+  void send_post_header();
   void send_next_header_part();
   void send_next_post_part();
   void schedule_next_send();
@@ -380,11 +386,17 @@ private:
   void log_lines(const char* header, const char* data, int size);
 };
 
-class SslConnection {
+class SslConnection : public Connection {
 public:
   SslConnection(Controller&, bool log);
+  virtual ~SslConnection();
 
   static void init_once();
+
+  virtual bool get_logging() { return logging_; }
+  virtual bool get_connected() {
+    return state_ != STATE_TCP_CONNECTING && state_ != STATE_SSL_CONNECTING;
+  }
 
 private:
   Controller&                   controller_;
@@ -477,8 +489,19 @@ void Controller::start_next_connection()
       if (num_connections_started_ == opts_.log_connection_) {
         logging = true;
       }
-      SlowHeadersHttpConnection* c = new SlowHeadersHttpConnection(
-          *this, logging);
+
+      Connection *c = NULL;
+
+      switch (get_options().run_) {
+      case Options::RUN_SLOW_HEADERS:
+      case Options::RUN_SLOW_POST:
+        c = new SlowHeadersHttpConnection(*this, logging);
+        break;
+      case Options::RUN_SSL_RENEG:
+        c = new SslConnection(*this, logging);
+        break;
+      }
+
       connections_.insert(c);
     } catch (const std::exception& e) {
       report_connection_error(NULL);
@@ -505,8 +528,7 @@ void Controller::start_next_connection()
   }
 }
 
-void Controller::report_connection_error(
-    class SlowHeadersHttpConnection* c)
+void Controller::report_connection_error(Connection* c)
 {
   if (c) {
     ConnectionSet::iterator i = connections_.find(c);
@@ -531,7 +553,7 @@ void Controller::report_connection_error(
   }
 }
 
-void Controller::report_connected(class SlowHeadersHttpConnection* c)
+void Controller::report_connected(Connection* c)
 {
   if (c) {
     ConnectionSet::iterator i = connections_.find(c);
@@ -626,10 +648,15 @@ void SlowHeadersHttpConnection::event_event(int what)
       std::cout << "EVENT_CONNECTED:" << std::endl;
     }
 
-    if (controller_.get_options().run_ == Options::RUN_SLOW_HEADERS) {
+    switch (controller_.get_options().run_) {
+    case Options::RUN_SLOW_HEADERS:
       send_partial_get_header();
-    } else {
+      break;
+    case Options::RUN_SLOW_POST:
       send_post_header();
+      break;
+    default:
+      assert(0);
     }
   }
 
@@ -863,6 +890,21 @@ SslConnection::SslConnection(Controller& shc, bool log)
   }
 }
 
+SslConnection::~SslConnection()
+{
+  event_del(event_);
+  event_free(event_);
+  event_ = NULL;
+
+  if (ssl_) {
+    SSL_free(ssl_);
+    ssl_ = NULL;
+  }
+
+  close(socket_);
+  socket_ = -1;
+}
+
 void SslConnection::event_cb(evutil_socket_t sock, short events, void *arg)
 {
   reinterpret_cast<SslConnection *>(arg)->event_event(sock, events);
@@ -899,6 +941,7 @@ void SslConnection::event_read()
       break;
     case STATE_SSL_CONNECTING:
       ssl_connect();
+      break;
     case STATE_SSL_CONNECTED:
     {
       char buf[1024];
@@ -923,6 +966,7 @@ void SslConnection::event_write()
       break;
     case STATE_SSL_CONNECTING:
       ssl_connect();
+      break;
     case STATE_SSL_CONNECTED:
       // std::cout << "ssl-connected: write" << std::endl;
       break;
@@ -951,13 +995,15 @@ void SslConnection::timer_event()
   case STATE_SSL_CONNECTED:
   {
     state_ = STATE_SSL_RENEGOTIATING;
-    std::cout << "SSL renegotiate" << std::endl;
     int ret = SSL_renegotiate(ssl_);
     if (ret != 1)
       throw_ssl_error("SSL_renegotiate");
     ssl_handshake();
     break;
   }
+  case STATE_SSL_RENEGOTIATING:
+    ssl_handshake();
+    break;
   default:
     break;
   }
@@ -966,14 +1012,21 @@ void SslConnection::timer_event()
 void SslConnection::tcp_connected()
 {
   state_ = STATE_SSL_CONNECTING;
-  std::cout << "EVENT_CONNECTED: !" << std::endl;
+  if (logging_) {
+    std::cout << "EVENT_CONNECTED:" << std::endl;
+  }
   ssl_connect();
 }
 
 void SslConnection::ssl_connected()
 {
   state_ = STATE_SSL_CONNECTED;
-  std::cout << "EVENT_SSL_CONNECTED: !" << std::endl;
+
+  if (logging_) {
+    std::cout << "EVENT_SSL_CONNECTED:" << std::endl;
+  }
+
+  controller_.report_connected(this);
 
   struct event *timer = evtimer_new(controller_.get_event_base(),
                                     &SslConnection::timer_cb,
@@ -1023,20 +1076,28 @@ void SslConnection::ssl_handshake()
   } else if (ret != 1) {
     // This must mean renegotiate isn't supported. But OpenSSL doesn't give
     // us any error info?
-    std::cout << "SSL_do_handshake failed" << std::endl;
-    throw_ssl_conn_error(ssl_, ret);
+    if (logging_) {
+      std::cout << "WARN: SSL_do_handshake failed: SSL renegotiation is not "
+        "supported." << std::endl;
+    }
+    controller_.report_connection_error(this);
+    return;
   }
 
   assert(SSL_renegotiate_pending(ssl_) == 0);
 
-  // std::cout << "SSL_renegotiate finished" << std::endl;
+  // Start re-negotiate
+  ret = SSL_renegotiate(ssl_);
+  if (ret != 1)
+    throw_ssl_error("SSL_renegotiate");
 
-  if (1) {
-    int ret = SSL_renegotiate(ssl_);
-    if (ret != 1)
-      throw_ssl_error("SSL_renegotiate");
-    ssl_handshake();
-  }
+  // Ensure we call SSL_do_handshake() "immediately". But we do this with a
+  // timer so we yield control back to the run loop.
+  struct event *timer = evtimer_new(controller_.get_event_base(),
+                                    &SslConnection::timer_cb,
+                                    this);
+  struct timeval tv = { 0, 0 };
+  evtimer_add(timer, &tv);
 }
 
 // -------------------------------------------------------------------------
@@ -1126,7 +1187,7 @@ void usage()
 void parse_options(Options* opts, int argc, char* argv[])
 {
   enum {
-    OPT_HOST = 1000, OPT_PORT, OPT_SLOW_HEADERS, OPT_SLOW_POST,
+    OPT_HOST = 1000, OPT_PORT, OPT_SLOW_HEADERS, OPT_SLOW_POST, OPT_SSL_RENEG,
     OPT_CONNECTIONS, OPT_RATE, OPT_TIMEOUT, OPT_POST,
     OPT_RANDOM_PATH, OPT_LOG_CONNECTION, OPT_POST_CONTENT_LENGTH,
     OPT_PATH, OPT_REPORT_INTERVAL, OPT_RANDOM_PAYLOAD,
@@ -1140,6 +1201,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "port", 1, 0, OPT_PORT },
     { "slow-headers", 0, 0, OPT_SLOW_HEADERS },
     { "slow-post", 0, 0, OPT_SLOW_POST },
+    { "ssl-renegotiation", 0, 0, OPT_SSL_RENEG },
     { "connections", 1, 0, OPT_CONNECTIONS },
     { "rate", 1, 0, OPT_RATE },
     { "timeout", 1, 0, OPT_TIMEOUT },
@@ -1195,6 +1257,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     GENERIC_ARG(OPT_PORT, host_port_, htons(atoi(optarg)));
     GENERIC_ARG(OPT_SLOW_HEADERS, run_, Options::RUN_SLOW_HEADERS);
     GENERIC_ARG(OPT_SLOW_POST, run_, Options::RUN_SLOW_POST);
+    GENERIC_ARG(OPT_SSL_RENEG, run_, Options::RUN_SSL_RENEG);
     INT_ARG(OPT_CONNECTIONS, connections_);
     INT_ARG(OPT_RATE, rate_);
     FLOAT_ARG(OPT_TIMEOUT, timeout_);
@@ -1233,14 +1296,12 @@ void parse_options(Options* opts, int argc, char* argv[])
 
 void run(const Options& opts)
 {
-  Controller controller(opts);
-
-  // controller.report();
-  // controller.start_next_connection();
-
   SslConnection::init_once();
 
-  SslConnection ssl(controller, true);
+  Controller controller(opts);
+
+  controller.report();
+  controller.start_next_connection();
 
   event_base_loop(controller.get_event_base(), 0);
 
