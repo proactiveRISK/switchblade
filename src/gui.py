@@ -71,8 +71,10 @@ class CliHandler(object):
           line.startswith('READ:') or
           line.startswith('EVENT_CONNECTING:') or
           line.startswith('EVENT_CONNECTED:') or
+          line.startswith('EVENT_SSL_CONNECTED:') or
           line.startswith('EVENT_DISCONNECTED:') or
-          line.startswith('ERROR:')):
+          line.startswith('ERROR:') or
+          line.startswith('WARN:')):
       gobject.idle_add(self.gui.cli_diag_line, line.strip())
     else:
       # Unknown. Nothing sensible to do here, really?
