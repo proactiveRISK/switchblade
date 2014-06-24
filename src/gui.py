@@ -251,7 +251,8 @@ class CliHandler(object):
 
 class GUI(object):
   RESPONSE_CANCEL_ATTACK = 1000
-  ATTACK_TYPE_SLOW_HEADERS, ATTACK_TYPE_SLOW_POST = ('Slow headers', 'Slow POST')
+  ATTACK_TYPE_SLOW_HEADERS, ATTACK_TYPE_SLOW_POST, ATTACK_TYPE_SSL_RENEG = (
+      'Slow headers', 'Slow POST', 'SSL renegotiation')
 
   def __init__(self):
     self.attack_info = {}
@@ -302,6 +303,7 @@ class GUI(object):
     self.attack_type_combobox = gtk.combo_box_new_text() 
     self.attack_type_combobox.append_text(self.ATTACK_TYPE_SLOW_HEADERS)
     self.attack_type_combobox.append_text(self.ATTACK_TYPE_SLOW_POST)
+    self.attack_type_combobox.append_text(self.ATTACK_TYPE_SSL_RENEG)
     self.attack_type_combobox.set_active(0)
     self.attack_type_combobox.connect('changed',
         self.on_attack_type_combobox_changed)
@@ -488,6 +490,8 @@ class GUI(object):
             sp_content_length)
     
       sp_field = sp_post_field_entry_str.strip()
+    elif attack_type == self.ATTACK_TYPE_SSL_RENEG:
+      raise Exception('SSL reneg is not yet renegotiated.')
 
     # Passed validation so we'll set up our attack_info dict:
     self.attack_info['attack_type'] = attack_type

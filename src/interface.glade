@@ -3,7 +3,7 @@
   <requires lib="gtk+" version="2.16"/>
   <!-- interface-naming-policy project-wide -->
   <object class="GtkWindow" id="main_window">
-    <property name="title" translatable="yes">HTTP attack (slow headers and slow POST attacks)</property>
+    <property name="title" translatable="yes">HTTP and SSL attacks</property>
     <child>
       <object class="GtkVBox" id="vbox1">
         <property name="visible">True</property>
@@ -514,6 +514,9 @@ attack information window.</property>
       </row>
       <row>
         <col id="0" translatable="yes">Slow POST</col>
+      </row>
+      <row>
+        <col id="0" translatable="yes">SSL renegotiate</col>
       </row>
     </data>
   </object>
