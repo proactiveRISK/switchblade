@@ -27,12 +27,16 @@
 
 #include <sys/types.h>
 #include <signal.h>
-#include <event.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <assert.h>
+
+#include <event2/event.h>
+#include <event2/event_struct.h>
+#include <event2/event_compat.h>
+#include <event2/bufferevent.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -882,7 +886,11 @@ SslConnection::SslConnection(Controller& shc, bool log)
     state_ = STATE_SSL_CONNECTING;
     ssl_connect();
   } else {
-    if (errno == EINPROGRESS || errno == EAGAIN) {
+    if (
+#ifndef PLAT_WIN32
+        errno == EINPROGRESS || 
+#endif
+        errno == EAGAIN) {
       // Expected, non-blocking isn't finished yet
     } else {
       throw_socket_error("connect");

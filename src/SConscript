@@ -20,7 +20,7 @@ env.Append(LIBS=['event', 'ssl', 'crypto'],
 
 if env['PLATFORM'] == 'win32':
   env.Append(
-      LIBS=['dnsapi', 'ws2_32'],
+      LIBS=['dnsapi', 'ws2_32', 'gdi32'],
       LINKFLAGS=['-static-libgcc', '-static-libstdc++'])
 else:
   env.Append(LIBS=['rt'])
