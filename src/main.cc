@@ -77,7 +77,7 @@ struct SocketSetupGuard
   }
 };
 
-void throw_socket_error(const std::string& str)
+std::string socket_error_desc(const std::string& str)
 {
   std::ostringstream oss;
   
@@ -98,10 +98,15 @@ void throw_socket_error(const std::string& str)
   oss << " failed: error " << error;
 #endif
 
-  throw std::runtime_error(oss.str());
+  return oss.str();
 }
 
-void throw_ssl_error(const std::string& str)
+void throw_socket_error(const std::string& str)
+{
+  throw std::runtime_error(socket_error_desc(str));
+}
+
+std::string ssl_error_desc(const std::string &str)
 {
   std::ostringstream oss;
   oss << str << ": ";
@@ -117,22 +122,32 @@ void throw_ssl_error(const std::string& str)
     oss << err_buf << " ";
   }
 
-  throw std::runtime_error(oss.str());
+  return oss.str();
 }
 
-void throw_ssl_conn_error(SSL *ssl, int ret)
+void throw_ssl_error(const std::string& str)
+{
+  throw std::runtime_error(ssl_error_desc(str));
+}
+
+std::string ssl_conn_error_desc(SSL *ssl, int ret)
 {
   int ssl_err = SSL_get_error(ssl, ret);
 
   if (ssl_err == SSL_ERROR_SSL)
-    throw_ssl_error("SSL connection error (ssl)");
+    return ssl_error_desc("SSL connection error (ssl)");
   if (ssl_err == SSL_ERROR_SYSCALL) {
-    throw_socket_error("SSL connection error (syscall)");
+    return socket_error_desc("SSL connection error (syscall)");
   }
 
   std::ostringstream oss;
   oss << "SSL connection error: " << ssl_err;
-  throw std::runtime_error(oss.str());
+  return oss.str();
+}
+
+void throw_ssl_conn_error(SSL *ssl, int ret)
+{
+  throw std::runtime_error(ssl_conn_error_desc(ssl, ret));
 }
 
 struct timeval float_to_timeval(double f)
@@ -326,7 +341,7 @@ public:
 
   void report();
   void start_next_connection(void);
-  void report_connection_error(class Connection* c);
+  void report_connection_error(class Connection* c, const std::string& str);
   void report_connected(class Connection* c);
 
   const Options& get_options() const { return opts_; }
@@ -488,27 +503,28 @@ void Controller::start_next_connection()
 {
   if (num_connections_started_ < opts_.connections_) {
     num_connections_started_++;
-    try {
-      bool logging = false;
-      if (num_connections_started_ == opts_.log_connection_) {
-        logging = true;
-      }
 
-      Connection *c = NULL;
+    bool logging = false;
+    if (num_connections_started_ == opts_.log_connection_) {
+      logging = true;
+    }
+
+    try {
+      std::auto_ptr<Connection> c;
 
       switch (get_options().run_) {
       case Options::RUN_SLOW_HEADERS:
       case Options::RUN_SLOW_POST:
-        c = new SlowHeadersHttpConnection(*this, logging);
+        c.reset(new SlowHeadersHttpConnection(*this, logging));
         break;
       case Options::RUN_SSL_RENEG:
-        c = new SslConnection(*this, logging);
+        c.reset(new SslConnection(*this, logging));
         break;
       }
 
-      connections_.insert(c);
+      connections_.insert(c.release());
     } catch (const std::exception& e) {
-      report_connection_error(NULL);
+      report_connection_error(NULL, e.what());
     }
 
     struct timeval timeout;
@@ -532,13 +548,13 @@ void Controller::start_next_connection()
   }
 }
 
-void Controller::report_connection_error(Connection* c)
+void Controller::report_connection_error(Connection* c, const std::string& str)
 {
   if (c) {
     ConnectionSet::iterator i = connections_.find(c);
     if (i != connections_.end()) {
       if (c->get_logging()) {
-        std::cout << "EVENT_DISCONNECTED:" << std::endl;
+        std::cout << "EVENT_DISCONNECTED: " << str << std::endl;
       }
       num_connections_errored_++;
       if (c->get_connected())
@@ -670,7 +686,7 @@ void SlowHeadersHttpConnection::event_event(int what)
       event_.reset();
     }
 
-    controller_.report_connection_error(this);
+    controller_.report_connection_error(this, "BEV_EVENT_ERROR|BEV_EVENT_EOF");
   }
 }
 
@@ -860,42 +876,13 @@ SslConnection::SslConnection(Controller& shc, bool log)
     throw std::runtime_error("event_add failed");
   }
 
-  const Options& opts = shc.get_options();
-  struct sockaddr_in addr;
-
-  addr.sin_family       = AF_INET;
-
-  if (opts.proxy_addr_) {
-    addr.sin_addr.s_addr  = opts.proxy_addr_;
-    addr.sin_port         = opts.proxy_port_;
-  } else {
-    addr.sin_addr.s_addr  = opts.host_addr_;
-    addr.sin_port         = opts.host_port_;
-  }
-
-  if (logging_) {
-    std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
-      << ":" << ntohs(addr.sin_port) << std::endl;
-  }
-
   state_ = STATE_TCP_CONNECTING;
 
-  int ret = ::connect(socket_, reinterpret_cast<struct sockaddr*>(&addr),
-      sizeof(addr));
-  if (ret == 0) {
-    state_ = STATE_SSL_CONNECTING;
-    ssl_connect();
-  } else {
-    if (
-#ifndef PLAT_WIN32
-        errno == EINPROGRESS || 
-#endif
-        errno == EAGAIN) {
-      // Expected, non-blocking isn't finished yet
-    } else {
-      throw_socket_error("connect");
-    }
-  }
+  struct event *timer = evtimer_new(controller_.get_event_base(),
+                                    &SslConnection::timer_cb,
+                                    this);
+  struct timeval tv = { 0, 0 };
+  evtimer_add(timer, &tv);
 }
 
 SslConnection::~SslConnection()
@@ -970,7 +957,7 @@ void SslConnection::event_write()
 {
   switch (state_) {
     case STATE_TCP_CONNECTING:
-      tcp_connected();
+      // tcp_connected();
       break;
     case STATE_SSL_CONNECTING:
       ssl_connect();
@@ -1000,6 +987,57 @@ void SslConnection::event_event(evutil_socket_t sock, short events)
 void SslConnection::timer_event()
 {
   switch (state_) {
+  case STATE_TCP_CONNECTING:
+  {
+    const Options& opts = controller_.get_options();
+    struct sockaddr_in addr;
+
+    addr.sin_family       = AF_INET;
+
+    if (opts.proxy_addr_) {
+      addr.sin_addr.s_addr  = opts.proxy_addr_;
+      addr.sin_port         = opts.proxy_port_;
+    } else {
+      addr.sin_addr.s_addr  = opts.host_addr_;
+      addr.sin_port         = opts.host_port_;
+    }
+
+    if (logging_) {
+      std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
+        << ":" << ntohs(addr.sin_port) << std::endl;
+    }
+
+    int ret = ::connect(socket_, reinterpret_cast<struct sockaddr*>(&addr),
+        sizeof(addr));
+
+    if (ret == 0) {
+      state_ = STATE_SSL_CONNECTING;
+      ssl_connect();
+    } else {
+      int error = errno;
+
+#ifdef PLAT_WIN32
+      error = WSAGetLastError();
+#endif
+
+      if (
+#ifdef PLAT_WIN32
+          error == WSAEWOULDBLOCK ||
+          error == WSAEINPROGRESS
+#endif
+#ifdef PLAT_LINUX
+          error == EINPROGRESS ||
+          error == EAGAIN
+#endif
+          ) {
+        // Expected, non-blocking isn't finished yet
+      } else {
+        controller_.report_connection_error(this, socket_error_desc("connect"));
+      }
+    }
+
+    break;
+  }
   case STATE_SSL_CONNECTED:
   {
     state_ = STATE_SSL_RENEGOTIATING;
@@ -1021,7 +1059,7 @@ void SslConnection::tcp_connected()
 {
   state_ = STATE_SSL_CONNECTING;
   if (logging_) {
-    std::cout << "EVENT_CONNECTED:" << std::endl;
+    std::cout << "EVENT_TCP_CONNECTED:" << std::endl;
   }
   ssl_connect();
 }
@@ -1059,11 +1097,11 @@ void SslConnection::ssl_connect()
         ssl_err == SSL_ERROR_WANT_WRITE)
       return;
 
-    throw_ssl_conn_error(ssl_, ret);
+    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
   } else if (ret == 1) {
     ssl_connected();
   } else if (ret == 0) {
-    throw_ssl_conn_error(ssl_, ret);
+    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
   } else {
     throw std::runtime_error("Invalid return code");
   }
@@ -1080,7 +1118,7 @@ void SslConnection::ssl_handshake()
         ssl_err == SSL_ERROR_WANT_WRITE)
       return;
 
-    throw_ssl_conn_error(ssl_, ret);
+    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
   } else if (ret != 1) {
     // This must mean renegotiate isn't supported. But OpenSSL doesn't give
     // us any error info?
@@ -1088,7 +1126,9 @@ void SslConnection::ssl_handshake()
       std::cout << "WARN: SSL_do_handshake failed: SSL renegotiation is not "
         "supported." << std::endl;
     }
-    controller_.report_connection_error(this);
+    std::ostringstream oss;
+    oss << "SSL_do_handshake returned " << ret;
+    controller_.report_connection_error(this, oss.str());
     return;
   }
 
@@ -1136,6 +1176,8 @@ void usage()
 "      Run slow-headers attack.\n"
 "  --slow-post\n"
 "      Run slow-post attack.\n"
+"  --ssl-renegotiation\n"
+"      Run SSL renegotiation attack.\n"
 "  --connections <num>\n"
 "      Number of connections to spawn.\n"
 "  --rate <num>\n"
