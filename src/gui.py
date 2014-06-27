@@ -327,6 +327,12 @@ class GUI(object):
     self.post_randomise_payload_checkbutton = builder.get_object(
         'post_randomise_payload_checkbutton')
 
+    # Attack-specific parameters: SSL renegotiate
+    self.ssl_reneg_parameter_table = builder.get_object(
+        'ssl_reneg_parameter_table')
+    self.ssl_reneg_do_reconnect_checkbox = builder.get_object(
+        'ssl_reneg_do_reconnect_checkbox')
+
     # ----
     # Attack dialog
     self.attack_dialog = builder.get_object('run_attack_dialog')
@@ -371,20 +377,28 @@ class GUI(object):
     for child in self.attack_specific_parameters_alignment.get_children():
       self.attack_specific_parameters_alignment.remove(child)
 
-    if self.attack_type_combobox.get_active() == 0:
+    active = self.attack_type_combobox.get_active()
+    if active == 0:
       if self.slow_headers_parameter_table.get_parent():
         self.slow_headers_parameter_table.reparent(
             self.attack_specific_parameters_alignment)
       else:
         self.attack_specific_parameters_alignment.add(
             self.slow_headers_parameter_table)
-    else:
+    elif active == 1:
       if self.slow_post_parameter_table.get_parent():
         self.slow_post_parameter_table.reparent(
             self.attack_specific_parameters_alignment)
       else:
         self.attack_specific_parameters_alignment.add(
             self.slow_post_parameter_table)
+    else:
+      if self.ssl_reneg_parameter_table.get_parent():
+        self.ssl_reneg_parameter_table.reparent(
+            self.attack_specific_parameters_alignment)
+      else:
+        self.attack_specific_parameters_alignment.add(
+            self.ssl_reneg_parameter_table)
 
   def validate_input(self):
     attack_type = self.attack_type_combobox.get_active_text()
