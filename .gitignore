@@ -1,2 +1,4 @@
-build/src/version.h
+build/
+src/*.swp
+*.swp
 .sconsign.dblite

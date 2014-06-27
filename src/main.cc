@@ -896,7 +896,7 @@ SslConnection::~SslConnection()
     ssl_ = NULL;
   }
 
-  close(socket_);
+  evutil_closesocket(socket_);
   socket_ = -1;
 }
 
