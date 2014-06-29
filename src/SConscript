@@ -14,7 +14,7 @@ def make_version(target, source, env):
       (int(version), int((version - int(version)) * 10)))
   f.close()
 
-env.Append(LIBS=['event', 'ssl', 'crypto'],
+env.Append(LIBS=['event', 'event_openssl', 'event_core', 'ssl', 'crypto'],
            CPPPATH=['.'],
            CXXFLAGS=['-g', '-O1'])
 

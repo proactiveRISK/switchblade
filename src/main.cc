@@ -37,6 +37,7 @@
 #include <event2/event_struct.h>
 #include <event2/event_compat.h>
 #include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -405,7 +406,7 @@ private:
   void log_lines(const char* header, const char* data, int size);
 };
 
-class SslConnection : public Connection {
+class SslConnection : public BufferEventHandler, public Connection {
 public:
   SslConnection(Controller&, bool log);
   virtual ~SslConnection();
@@ -413,35 +414,24 @@ public:
   static void init_once();
 
   virtual bool get_logging() { return logging_; }
-  virtual bool get_connected() {
-    return state_ != STATE_TCP_CONNECTING && state_ != STATE_SSL_CONNECTING;
-  }
+  virtual bool get_connected() { return connected_; }
 
 private:
   Controller&                   controller_;
   int                           socket_;
+  BufferEventGuard              buf_;
   bool                          logging_;
+  bool                          connected_;
+  int                           renegotiates_;
   SSL*                          ssl_;
-  struct event*                 event_;
-  enum {
-    STATE_TCP_CONNECTING,
-    STATE_SSL_CONNECTING,
-    STATE_SSL_CONNECTED,
-    STATE_SSL_RENEGOTIATING
-  }                             state_;
-
+  std::auto_ptr<struct event>   event_;
   static SSL_CTX*               ctx_;
 
-  static void event_cb(evutil_socket_t, short, void *);
   static void timer_cb(evutil_socket_t sock, short events, void *arg);
-  void event_read();
-  void event_write();
-  void event_event(evutil_socket_t sock, short events);
+  virtual void event_read();
+  virtual void event_write();
+  virtual void event_event(int what);
   void timer_event();
-  void tcp_connected();
-  void ssl_connected();
-  void ssl_connect();
-  void ssl_handshake();
 };
 
 void BufferEventHandler::buf_event_read_cb(struct bufferevent* be, void* arg)
@@ -856,8 +846,8 @@ void SlowHeadersHttpConnection::send_next_post_part()
 SSL_CTX *SslConnection::ctx_;
   
 SslConnection::SslConnection(Controller& shc, bool log)
-  : controller_(shc), logging_(log), ssl_(NULL), event_(NULL),
-    state_(STATE_TCP_CONNECTING)
+  : controller_(shc), logging_(log), connected_(false), ssl_(NULL),
+    event_(NULL), renegotiates_(0)
 {
   socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket_ == -1) {
@@ -866,43 +856,56 @@ SslConnection::SslConnection(Controller& shc, bool log)
 
   evutil_make_socket_nonblocking(socket_);
 
-  event_ = event_new(controller_.get_event_base(),
-                     socket_,
-                     EV_READ|EV_WRITE|EV_PERSIST,
-                     &SslConnection::event_cb,
-                     this);
+  ssl_ = SSL_new(ctx_);
+  assert(ssl_);  // TODO: guard around ssl_
 
-  if (event_add(event_, NULL) != 0) {
-    throw std::runtime_error("event_add failed");
+  buf_.init(bufferevent_openssl_socket_new(controller_.get_event_base(),
+        socket_, ssl_, BUFFEREVENT_SSL_CONNECTING,
+        BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS));
+  if (!buf_.get()) {
+    throw std::runtime_error("Could not create new bufferevent: out of "
+        "memory?");
   }
 
-  state_ = STATE_TCP_CONNECTING;
+  bufferevent_setcb(buf_.get(),
+      &BufferEventHandler::buf_event_read_cb,
+      &BufferEventHandler::buf_event_write_cb,
+      &BufferEventHandler::buf_event_event_cb,
+      this);
+  bufferevent_enable(buf_.get(), EV_READ|EV_WRITE);
 
-  struct event *timer = evtimer_new(controller_.get_event_base(),
-                                    &SslConnection::timer_cb,
-                                    this);
-  struct timeval tv = { 0, 0 };
-  evtimer_add(timer, &tv);
+  const Options& opts = controller_.get_options();
+  struct sockaddr_in addr;
+
+  addr.sin_family       = AF_INET;
+
+  if (opts.proxy_addr_) {
+    addr.sin_addr.s_addr  = opts.proxy_addr_;
+    addr.sin_port         = opts.proxy_port_;
+  } else {
+    addr.sin_addr.s_addr  = opts.host_addr_;
+    addr.sin_port         = opts.host_port_;
+  }
+
+  if (logging_) {
+    std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
+      << ":" << ntohs(addr.sin_port) << std::endl;
+  }
+
+  if (bufferevent_socket_connect(buf_.get(),
+        reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    throw std::runtime_error("Got error in bufferevent_socket_new(): should "
+        "not fail here.");
+  }
 }
 
 SslConnection::~SslConnection()
 {
-  event_del(event_);
-  event_free(event_);
-  event_ = NULL;
-
-  if (ssl_) {
-    SSL_free(ssl_);
-    ssl_ = NULL;
-  }
-
-  evutil_closesocket(socket_);
-  socket_ = -1;
-}
-
-void SslConnection::event_cb(evutil_socket_t sock, short events, void *arg)
-{
-  reinterpret_cast<SslConnection *>(arg)->event_event(sock, events);
+  // FIXME
+  //if (ssl_) {
+  //  SSL_free(ssl_);
+  //  ssl_ = NULL;
+  //}
 }
 
 void SslConnection::timer_cb(evutil_socket_t sock, short events, void *arg)
@@ -912,8 +915,10 @@ void SslConnection::timer_cb(evutil_socket_t sock, short events, void *arg)
 
 void SslConnection::init_once()
 {
-  SSL_load_error_strings();
   SSL_library_init();
+  SSL_load_error_strings();
+  // SSL_load_crypto_strings();
+  OpenSSL_add_all_algorithms();
 
   ctx_ = SSL_CTX_new(SSLv23_method());
   if (!ctx_)
@@ -928,224 +933,71 @@ void SslConnection::init_once()
 #endif
 }
 
+void SslConnection::timer_event()
+{
+}
+
 void SslConnection::event_read()
 {
-  switch (state_) {
-    case STATE_TCP_CONNECTING:
-      tcp_connected();
-      break;
-    case STATE_SSL_CONNECTING:
-      ssl_connect();
-      break;
-    case STATE_SSL_CONNECTED:
-    {
-      char buf[1024];
-      while (SSL_read(ssl_, buf, sizeof(buf)) > 0)
-        ;
-      break;
-    }
-    case STATE_SSL_RENEGOTIATING:
-      ssl_handshake();
-      break;
-    default:
-      assert(0);
-      break;
-  };
+  printf("event_read\n");
 }
 
 void SslConnection::event_write()
 {
-  switch (state_) {
-    case STATE_TCP_CONNECTING:
-      // tcp_connected();
-      break;
-    case STATE_SSL_CONNECTING:
-      ssl_connect();
-      break;
-    case STATE_SSL_CONNECTED:
-      // std::cout << "ssl-connected: write" << std::endl;
-      break;
-    case STATE_SSL_RENEGOTIATING:
-      ssl_handshake();
-      break;
-    default:
-      assert(0);
-      break;
-  };
+  printf("event_write\n");
 }
 
-void SslConnection::event_event(evutil_socket_t sock, short events)
+void SslConnection::event_event(int what)
 {
-  if (events & EV_WRITE)
-    event_write();
-  if (events & EV_READ)
-    event_read();
-  if (events & ~(EV_WRITE|EV_READ))
-    assert(0); // FIXME
-}
-
-void SslConnection::timer_event()
-{
-  switch (state_) {
-  case STATE_TCP_CONNECTING:
-  {
-    const Options& opts = controller_.get_options();
-    struct sockaddr_in addr;
-
-    addr.sin_family       = AF_INET;
-
-    if (opts.proxy_addr_) {
-      addr.sin_addr.s_addr  = opts.proxy_addr_;
-      addr.sin_port         = opts.proxy_port_;
-    } else {
-      addr.sin_addr.s_addr  = opts.host_addr_;
-      addr.sin_port         = opts.host_port_;
-    }
+  if (what & BEV_EVENT_CONNECTED) {
+    if (!connected_)
+      controller_.report_connected(this);
+    if (connected_)
+      renegotiates_++;
 
     if (logging_) {
-      std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
-        << ":" << ntohs(addr.sin_port) << std::endl;
+      if (connected_ && renegotiates_ % 500 == 0)
+        std::cout << "EVENT_CONNECTED: " << renegotiates_ << " renegotiates" << std::endl;
+      else if (!connected_)
+        std::cout << "EVENT_CONNECTED:" << std::endl;
     }
-
-    int ret = ::connect(socket_, reinterpret_cast<struct sockaddr*>(&addr),
-        sizeof(addr));
-
-    if (ret == 0) {
-      state_ = STATE_SSL_CONNECTING;
-      ssl_connect();
-    } else {
-      int error = errno;
-
-#ifdef PLAT_WIN32
-      error = WSAGetLastError();
-#endif
-
-      if (
-#ifdef PLAT_WIN32
-          error == WSAEWOULDBLOCK ||
-          error == WSAEINPROGRESS
-#endif
-#ifdef PLAT_LINUX
-          error == EINPROGRESS ||
-          error == EAGAIN
-#endif
-          ) {
-        // Expected, non-blocking isn't finished yet
-      } else {
-        controller_.report_connection_error(this, socket_error_desc("connect"));
-      }
-    }
-
-    break;
-  }
-  case STATE_SSL_CONNECTED:
-  {
-    state_ = STATE_SSL_RENEGOTIATING;
-    int ret = SSL_renegotiate(ssl_);
-    if (ret != 1)
-      throw_ssl_error("SSL_renegotiate");
-    ssl_handshake();
-    break;
-  }
-  case STATE_SSL_RENEGOTIATING:
-    ssl_handshake();
-    break;
-  default:
-    break;
-  }
-}
-
-void SslConnection::tcp_connected()
-{
-  state_ = STATE_SSL_CONNECTING;
-  if (logging_) {
-    std::cout << "EVENT_TCP_CONNECTED:" << std::endl;
-  }
-  ssl_connect();
-}
-
-void SslConnection::ssl_connected()
-{
-  state_ = STATE_SSL_CONNECTED;
-
-  if (logging_) {
-    std::cout << "EVENT_SSL_CONNECTED:" << std::endl;
+    
+    connected_ = true;
+    
+    bufferevent_ssl_renegotiate(buf_.get());
   }
 
-  controller_.report_connected(this);
-
-  struct event *timer = evtimer_new(controller_.get_event_base(),
-                                    &SslConnection::timer_cb,
-                                    this);
-  struct timeval tv = { 1, 0 };
-  evtimer_add(timer, &tv);
-}
-
-void SslConnection::ssl_connect()
-{
-  if (!ssl_) {
-    ssl_ = SSL_new(ctx_);
-    SSL_set_fd(ssl_, socket_);
-  }
-
-  int ret = SSL_connect(ssl_);
-  if (ret < 0) {
-    int ssl_err = SSL_get_error(ssl_, ret);
-
-    // Non-blocking, just need to keep polling connect
-    if (ssl_err == SSL_ERROR_WANT_READ ||
-        ssl_err == SSL_ERROR_WANT_WRITE)
-      return;
-
-    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
-  } else if (ret == 1) {
-    ssl_connected();
-  } else if (ret == 0) {
-    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
-  } else {
-    throw std::runtime_error("Invalid return code");
-  }
-}
-
-void SslConnection::ssl_handshake()
-{
-  int ret = SSL_do_handshake(ssl_);
-  if (ret < 0) {
-    int ssl_err = SSL_get_error(ssl_, ret);
-
-    // Non-blocking, just need to keep polling connect
-    if (ssl_err == SSL_ERROR_WANT_READ ||
-        ssl_err == SSL_ERROR_WANT_WRITE)
-      return;
-
-    controller_.report_connection_error(this, ssl_conn_error_desc(ssl_, ret));
-  } else if (ret != 1) {
-    // This must mean renegotiate isn't supported. But OpenSSL doesn't give
-    // us any error info?
-    if (logging_) {
-      std::cout << "WARN: SSL_do_handshake failed: SSL renegotiation is not "
-        "supported." << std::endl;
-    }
+  if (what & BEV_EVENT_ERROR) {
     std::ostringstream oss;
-    oss << "SSL_do_handshake returned " << ret;
+
+    int sock_err = EVUTIL_SOCKET_ERROR();
+
+    if (sock_err) {
+      oss << "socket_error " << sock_err;
+    }
+
+    bool has_openssl_err = false;
+
+    unsigned long err;
+    while ((err = (bufferevent_get_openssl_error(buf_.get())))) {
+      const char *msg = (const char*)ERR_reason_error_string(err);
+      const char *lib = (const char*)ERR_lib_error_string(err);
+      const char *func = (const char*)ERR_func_error_string(err);
+      if (!has_openssl_err) {
+        oss << " openssl error ";
+        has_openssl_err = true;
+      }
+      oss << msg << " in " << lib << " " << func;
+    }
+
+    if (!sock_err && !has_openssl_err) {
+      // SSL reneg is probably disabled
+    }
+
     controller_.report_connection_error(this, oss.str());
-    return;
+  } else if (what & BEV_EVENT_EOF) {
+    controller_.report_connection_error(this, "EOF");
   }
-
-  assert(SSL_renegotiate_pending(ssl_) == 0);
-
-  // Start re-negotiate
-  ret = SSL_renegotiate(ssl_);
-  if (ret != 1)
-    throw_ssl_error("SSL_renegotiate");
-
-  // Ensure we call SSL_do_handshake() "immediately". But we do this with a
-  // timer so we yield control back to the run loop.
-  struct event *timer = evtimer_new(controller_.get_event_base(),
-                                    &SslConnection::timer_cb,
-                                    this);
-  struct timeval tv = { 0, 0 };
-  evtimer_add(timer, &tv);
 }
 
 // -------------------------------------------------------------------------
