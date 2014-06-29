@@ -208,6 +208,7 @@ struct Options {
   bool          random_payload_;
   bool          random_post_content_length_;
   bool          random_timeout_;
+  bool          ssl_reconnect_on_failure_;
   std::string   proxy_;
   uint32_t      proxy_addr_;   // Network byte order
   uint16_t      proxy_port_;   // Network byte order
@@ -234,6 +235,7 @@ struct Options {
       random_payload_(false),
       random_post_content_length_(false),
       random_timeout_(false),
+      ssl_reconnect_on_failure_(false),
       proxy_(),
       proxy_addr_(0),
       proxy_port_(htons(80)),
@@ -344,6 +346,7 @@ public:
   void start_next_connection(void);
   void report_connection_error(class Connection* c, const std::string& str);
   void report_connected(class Connection* c);
+  void restart_connection(class Connection *c);
 
   const Options& get_options() const { return opts_; }
   struct event_base* get_event_base() const { return event_base_; }
@@ -353,6 +356,7 @@ private:
 
   static void report_cb(int fd, short what, void* arg);
   static void start_next_connection_cb(int fd, short what, void* arg);
+  void start_new_connection_internal(bool logging);
 
   const Options&  opts_;
   struct event_base *event_base_;
@@ -489,6 +493,23 @@ void Controller::report()
   evtimer_add(report_event_.get(), &timeout);
 }
 
+void Controller::start_new_connection_internal(bool logging)
+{
+  std::auto_ptr<Connection> c;
+
+  switch (get_options().run_) {
+    case Options::RUN_SLOW_HEADERS:
+    case Options::RUN_SLOW_POST:
+      c.reset(new SlowHeadersHttpConnection(*this, logging));
+      break;
+    case Options::RUN_SSL_RENEG:
+      c.reset(new SslConnection(*this, logging));
+      break;
+  }
+
+  connections_.insert(c.release());
+}
+
 void Controller::start_next_connection()
 {
   if (num_connections_started_ < opts_.connections_) {
@@ -500,19 +521,7 @@ void Controller::start_next_connection()
     }
 
     try {
-      std::auto_ptr<Connection> c;
-
-      switch (get_options().run_) {
-      case Options::RUN_SLOW_HEADERS:
-      case Options::RUN_SLOW_POST:
-        c.reset(new SlowHeadersHttpConnection(*this, logging));
-        break;
-      case Options::RUN_SSL_RENEG:
-        c.reset(new SslConnection(*this, logging));
-        break;
-      }
-
-      connections_.insert(c.release());
+      start_new_connection_internal(logging);
     } catch (const std::exception& e) {
       report_connection_error(NULL, e.what());
     }
@@ -571,6 +580,21 @@ void Controller::report_connected(Connection* c)
       num_connections_connected_++;
     }
   }
+}
+
+void Controller::restart_connection(Connection *c)
+{
+  bool logging = c->get_logging();
+  ConnectionSet::iterator i = connections_.find(c);
+  if (i != connections_.end()) {
+    if (c->get_logging()) {
+      std::cout << "EVENT_DISCONNECTED: " << std::endl;
+    }
+    connections_.erase(i);
+    delete c;
+  }
+  
+  start_new_connection_internal(logging);
 }
 
 SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
@@ -901,11 +925,6 @@ SslConnection::SslConnection(Controller& shc, bool log)
 
 SslConnection::~SslConnection()
 {
-  // FIXME
-  //if (ssl_) {
-  //  SSL_free(ssl_);
-  //  ssl_ = NULL;
-  //}
 }
 
 void SslConnection::timer_cb(evutil_socket_t sock, short events, void *arg)
@@ -990,8 +1009,12 @@ void SslConnection::event_event(int what)
       oss << msg << " in " << lib << " " << func;
     }
 
-    if (!sock_err && !has_openssl_err) {
+    if (!sock_err && !has_openssl_err && connected_) {
       // SSL reneg is probably disabled
+      if (controller_.get_options().ssl_reconnect_on_failure_) {
+        controller_.restart_connection(this);
+        return;
+      }
     }
 
     controller_.report_connection_error(this, oss.str());
@@ -1082,6 +1105,12 @@ void usage()
 "      then any data will follow. Without this option specified, the data in\n"
 "      the post is sent raw without any prefix.\n"
 "\n"
+"ssl-renegotiate specific options:\n"
+"  --ssl-reconnect-on-failure\n"
+"      If SSL renegotiation is disabled on the server, then sockets will\n"
+"      close on the first renegotiation attempt. If this option is enabled,\n"
+"      then the attack will continue by reconnecting to the server.\n"
+"\n"
 "  --help         : Show this usage statement\n"
 ;
 }
@@ -1095,7 +1124,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     OPT_PATH, OPT_REPORT_INTERVAL, OPT_RANDOM_PAYLOAD,
     OPT_RANDOM_POST_CONTENT_LENGTH, OPT_RANDOM_TIMEOUT, OPT_SEED,
     OPT_USER_AGENT, OPT_POST_FIELD, OPT_PROXY, OPT_PROXY_PORT, OPT_STAY_OPEN,
-    OPT_HELP
+    OPT_SSL_RECONNECT_ON_FAILURE, OPT_HELP
   };
 
   static struct option long_options[] = {
@@ -1118,6 +1147,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "random-timeout", 0, 0, OPT_RANDOM_TIMEOUT },
     { "user-agent", 1, 0, OPT_USER_AGENT },
     { "post-field", 1, 0, OPT_POST_FIELD },
+    { "ssl-reconnect-on-failure", 0, 0, OPT_SSL_RECONNECT_ON_FAILURE },
     { "proxy", 1, 0, OPT_PROXY },
     { "proxy-port", 1, 0, OPT_PROXY_PORT },
     { "seed", 1, 0, OPT_SEED },
@@ -1174,6 +1204,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     BOOL_ARG(OPT_RANDOM_TIMEOUT, random_timeout_);
     STRING_ARG(OPT_USER_AGENT, user_agent_);
     STRING_ARG(OPT_POST_FIELD, post_field_);
+    BOOL_ARG(OPT_SSL_RECONNECT_ON_FAILURE, ssl_reconnect_on_failure_);
     HOST_ARG(OPT_PROXY, proxy_, proxy_addr_);
     GENERIC_ARG(OPT_PROXY_PORT, proxy_port_, htons(atoi(optarg)));
     BOOL_ARG(OPT_STAY_OPEN, stay_open_);
