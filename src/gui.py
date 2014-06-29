@@ -74,7 +74,7 @@ class CliHandler(object):
           line.startswith('EVENT_SSL_CONNECTED:') or
           line.startswith('EVENT_DISCONNECTED:') or
           line.startswith('ERROR:') or
-          line.startswith('WARN:')):
+          line.startswith('NOTIFY:')):
       gobject.idle_add(self.gui.cli_diag_line, line.strip())
     else:
       # Unknown. Nothing sensible to do here, really?
@@ -151,6 +151,10 @@ class CliHandler(object):
         c.append('--post-field=%s' % attack_info['sp_field'])
       if attack_info['sp_randomise_payload']:
         c.append('--random-payload')
+    elif attack_info['attack_type'] == GUI.ATTACK_TYPE_SSL_RENEG:
+      c.append('--ssl-renegotiation')
+      if attack_info['sp_ssl_do_reconnect']:
+        c.append('--ssl-reconnect-on-failure')
 
     return c
 
@@ -422,17 +426,34 @@ class GUI(object):
           'and less than or equal to 40000.')
 
     url = urlparse.urlparse(url_str)
-    if not url.scheme:
-      url.scheme = 'http'
-    if url.scheme != 'http':
-      raise Exception('Please enter a URL of a web server to attack.\n'
-          'Example "http://example.com".\n\n'
-          'The text entered "<b>%s</b>" resulted in a scheme of "%s", but '
-          'only "http" is supported.' % (url_str, url.scheme))
-    if not url.netloc:
-      raise Exception('Please enter a URL of a web server to attack.\n'
-          'Example "http://example.com".\n\n'
-          'The text entered "<b>%s</b>" is not a valid URL.' % url_str)
+    if attack_type != self.ATTACK_TYPE_SSL_RENEG:
+      if not url.scheme:
+        url.scheme = 'http'
+      if url.scheme != 'http':
+        raise Exception('Please enter a URL of a web server to attack.\n'
+            'Example "http://example.com".\n\n'
+            'The text entered "<b>%s</b>" resulted in a scheme of "%s", but '
+            'only "http" is supported.' % (url_str, url.scheme))
+      if not url.netloc:
+        raise Exception('Please enter a URL of a web server to attack.\n'
+            'Example "http://example.com".\n\n'
+            'The text entered "<b>%s</b>" is not a valid URL.' % url_str)
+    else:
+      if url.scheme:
+        raise Exception('URL scheme (http/https/etc.) should not be\n'
+            'specified for the SSL attack. Instead, specify a host:port\n'
+            'combination (e.g. google.com:443)')
+      if url_str.find('/') != -1:
+        raise Exception('URL path (e.g. /test.html) is not used for the\n'
+            'SSL attack. Instead, specify a host:port combination\n'
+            '(e.g. google.com:443)')
+      if url_str.find(':') != -1:
+        host = url_str[:url_str.find(':')]
+        port = url_str[url_str.find(':') + 1:]
+        url = urlparse.urlparse('https://%s:%s/ignored' % (host, port))
+      else:
+        url = urlparse.urlparse('https://%s:%d/ignored' % (url_str, 443))
+
 
     proxy_url = ''
     if proxy_str.strip():
@@ -481,6 +502,7 @@ class GUI(object):
     sp_content_length_randomise = False
     sp_field = ''
     sp_randomise_payload = False
+    sp_ssl_do_reconnect = False
 
     if attack_type == self.ATTACK_TYPE_SLOW_HEADERS:
       sh_use_post = self.slow_headers_use_post_checkbutton.get_active()
@@ -505,7 +527,7 @@ class GUI(object):
     
       sp_field = sp_post_field_entry_str.strip()
     elif attack_type == self.ATTACK_TYPE_SSL_RENEG:
-      raise Exception('SSL reneg is not yet renegotiated.')
+      sp_ssl_do_reconnect = self.ssl_reneg_do_reconnect_checkbox.get_active()
 
     # Passed validation so we'll set up our attack_info dict:
     self.attack_info['attack_type'] = attack_type
@@ -522,6 +544,7 @@ class GUI(object):
     self.attack_info['sp_content_length_randomise'] = sp_content_length_randomise
     self.attack_info['sp_field']    = sp_field
     self.attack_info['sp_randomise_payload'] = sp_randomise_payload
+    self.attack_info['sp_ssl_do_reconnect'] = sp_ssl_do_reconnect
 
   def show_error_dialog(self, error):
     error_dlg = gtk.MessageDialog(
@@ -609,6 +632,8 @@ class GUI(object):
         text_buf.insert_with_tags_by_name(tb_iter, line[8:], 'red-bg')
       else:
         text_buf.insert_with_tags_by_name(tb_iter, line[8:] + '\n', 'red-bg')
+    elif line.startswith('NOTIFY:'):
+      text_buf.insert_with_tags_by_name(tb_iter, line[8:] + '\n', 'green-bg')
     else:
       if line.startswith('EVENT_CONNECTED:'):
         text_buf.insert(tb_iter, 'Connected.\n')

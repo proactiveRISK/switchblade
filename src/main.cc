@@ -976,7 +976,7 @@ void SslConnection::event_event(int what)
 
     if (logging_) {
       if (connected_ && renegotiates_ % 500 == 0)
-        std::cout << "EVENT_CONNECTED: " << renegotiates_ << " renegotiates" << std::endl;
+        std::cout << "NOTIFY: " << renegotiates_ << " SSL renegotiations" << std::endl;
       else if (!connected_)
         std::cout << "EVENT_CONNECTED:" << std::endl;
     }
