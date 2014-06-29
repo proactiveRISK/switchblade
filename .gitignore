@@ -1,4 +1,6 @@
-build/
+build
 src/*.swp
 *.swp
+*.o
+*.exe
 .sconsign.dblite
