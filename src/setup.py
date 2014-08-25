@@ -18,9 +18,9 @@ from distutils.core import setup
 import py2exe
 
 setup(
-    name = 'http_dos_tool',
-    description = 'HTTP denial of service test application',
-    version = '1.0',
+    name = 'switch_blade',
+    description = 'SwitchBlade by Proactive Risk',
+    version = '4.0',
 
     windows = [
       {

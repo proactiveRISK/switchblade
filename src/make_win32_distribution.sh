@@ -2,7 +2,7 @@
 
 set -e
 
-rm -fr HttpDosTool dist
+rm -fr SwitchBlade dist
 
 cp ../build/src/http_dos_cli.exe .
 
@@ -28,6 +28,6 @@ cp -r "${gtk_locale_dir}/en_CA"   dist/share/locale
 
 VERSION=$(cat VERSION)
 
-mv dist HttpDosTool
-zip -r -9 HttpDosTool${VERSION}.zip HttpDosTool/
+mv dist SwitchBlade 
+zip -r -9 SwitchBlade${VERSION}.zip SwitchBlade/
 
