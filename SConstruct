@@ -17,29 +17,28 @@
 import os
 import sys
 
-# libevent location
-libevent_loc = ARGUMENTS.get('libevent')
-if not libevent_loc:
-  if sys.platform == 'win32':
-    libevent_loc = '../../local'
-  else:
-    libevent_loc = '..'
-libevent_loc = '#' + libevent_loc
+deps_loc = ARGUMENTS.get('deps')
+if not deps_loc:
+  deps_loc = '../deps'
+deps_loc = '#' + deps_loc
 
 # Build env
+
+cflags = ''
 
 if sys.platform == 'win32':
   env = Environment(tools=['mingw'],
           LINKFLAGS=['-Wl,--enable-auto-import'],
-          LIBPATH=[os.path.join(libevent_loc, 'lib')],
-          CPPPATH=[os.path.join(libevent_loc, 'include')],
-          CPPDEFINES=['PLAT_WIN32']
-          )
+          LIBPATH=[os.path.join(deps_loc, 'lib')],
+          CPPPATH=[os.path.join(deps_loc, 'include')],
+          CPPDEFINES=['PLAT_WIN32'],
+          CFLAGS=cflags)
 else:
   env = Environment(
-          LIBPATH=[os.path.join(libevent_loc, 'lib')],
-          CPPPATH=[os.path.join(libevent_loc, 'include')],
-          CPPDEFINES=['PLAT_LINUX'])
+          LIBPATH=[os.path.join(deps_loc, 'lib')],
+          CPPPATH=[os.path.join(deps_loc, 'include')],
+          CPPDEFINES=['PLAT_LINUX'],
+          CFLAGS=cflags)
 
 variant_dir = 'build'
 VariantDir(variant_dir, '.', duplicate=0)

@@ -71,8 +71,10 @@ class CliHandler(object):
           line.startswith('READ:') or
           line.startswith('EVENT_CONNECTING:') or
           line.startswith('EVENT_CONNECTED:') or
+          line.startswith('EVENT_SSL_CONNECTED:') or
           line.startswith('EVENT_DISCONNECTED:') or
-          line.startswith('ERROR:')):
+          line.startswith('ERROR:') or
+          line.startswith('NOTIFY:')):
       gobject.idle_add(self.gui.cli_diag_line, line.strip())
     else:
       # Unknown. Nothing sensible to do here, really?
@@ -149,6 +151,10 @@ class CliHandler(object):
         c.append('--post-field=%s' % attack_info['sp_field'])
       if attack_info['sp_randomise_payload']:
         c.append('--random-payload')
+    elif attack_info['attack_type'] == GUI.ATTACK_TYPE_SSL_RENEG:
+      c.append('--ssl-renegotiation')
+      if attack_info['sp_ssl_do_reconnect']:
+        c.append('--ssl-reconnect-on-failure')
 
     return c
 
@@ -249,7 +255,8 @@ class CliHandler(object):
 
 class GUI(object):
   RESPONSE_CANCEL_ATTACK = 1000
-  ATTACK_TYPE_SLOW_HEADERS, ATTACK_TYPE_SLOW_POST = ('Slow headers', 'Slow POST')
+  ATTACK_TYPE_SLOW_HEADERS, ATTACK_TYPE_SLOW_POST, ATTACK_TYPE_SSL_RENEG = (
+      'Slow headers', 'Slow POST', 'SSL renegotiation')
 
   def __init__(self):
     self.attack_info = {}
@@ -274,7 +281,7 @@ class GUI(object):
     self.window = builder.get_object('main_window')
     self.window.connect('delete-event', gtk.main_quit)
     self.window.set_title(
-        'HTTP attack version %3.1f (slow headers and slow POST)' %
+        'SwitchBlade V%3.1f from ProactiveRISK' %
         self.version)
 
     self.quit_button = builder.get_object('quit_button')
@@ -300,6 +307,7 @@ class GUI(object):
     self.attack_type_combobox = gtk.combo_box_new_text() 
     self.attack_type_combobox.append_text(self.ATTACK_TYPE_SLOW_HEADERS)
     self.attack_type_combobox.append_text(self.ATTACK_TYPE_SLOW_POST)
+    self.attack_type_combobox.append_text(self.ATTACK_TYPE_SSL_RENEG)
     self.attack_type_combobox.set_active(0)
     self.attack_type_combobox.connect('changed',
         self.on_attack_type_combobox_changed)
@@ -322,6 +330,12 @@ class GUI(object):
         'post_field_entry')
     self.post_randomise_payload_checkbutton = builder.get_object(
         'post_randomise_payload_checkbutton')
+
+    # Attack-specific parameters: SSL renegotiate
+    self.ssl_reneg_parameter_table = builder.get_object(
+        'ssl_reneg_parameter_table')
+    self.ssl_reneg_do_reconnect_checkbox = builder.get_object(
+        'ssl_reneg_do_reconnect_checkbox')
 
     # ----
     # Attack dialog
@@ -367,20 +381,28 @@ class GUI(object):
     for child in self.attack_specific_parameters_alignment.get_children():
       self.attack_specific_parameters_alignment.remove(child)
 
-    if self.attack_type_combobox.get_active() == 0:
+    active = self.attack_type_combobox.get_active()
+    if active == 0:
       if self.slow_headers_parameter_table.get_parent():
         self.slow_headers_parameter_table.reparent(
             self.attack_specific_parameters_alignment)
       else:
         self.attack_specific_parameters_alignment.add(
             self.slow_headers_parameter_table)
-    else:
+    elif active == 1:
       if self.slow_post_parameter_table.get_parent():
         self.slow_post_parameter_table.reparent(
             self.attack_specific_parameters_alignment)
       else:
         self.attack_specific_parameters_alignment.add(
             self.slow_post_parameter_table)
+    else:
+      if self.ssl_reneg_parameter_table.get_parent():
+        self.ssl_reneg_parameter_table.reparent(
+            self.attack_specific_parameters_alignment)
+      else:
+        self.attack_specific_parameters_alignment.add(
+            self.ssl_reneg_parameter_table)
 
   def validate_input(self):
     attack_type = self.attack_type_combobox.get_active_text()
@@ -404,17 +426,34 @@ class GUI(object):
           'and less than or equal to 40000.')
 
     url = urlparse.urlparse(url_str)
-    if not url.scheme:
-      url.scheme = 'http'
-    if url.scheme != 'http':
-      raise Exception('Please enter a URL of a web server to attack.\n'
-          'Example "http://example.com".\n\n'
-          'The text entered "<b>%s</b>" resulted in a scheme of "%s", but '
-          'only "http" is supported.' % (url_str, url.scheme))
-    if not url.netloc:
-      raise Exception('Please enter a URL of a web server to attack.\n'
-          'Example "http://example.com".\n\n'
-          'The text entered "<b>%s</b>" is not a valid URL.' % url_str)
+    if attack_type != self.ATTACK_TYPE_SSL_RENEG:
+      if not url.scheme:
+        url.scheme = 'http'
+      if url.scheme != 'http':
+        raise Exception('Please enter a URL of a web server to attack.\n'
+            'Example "http://example.com".\n\n'
+            'The text entered "<b>%s</b>" resulted in a scheme of "%s", but '
+            'only "http" is supported.' % (url_str, url.scheme))
+      if not url.netloc:
+        raise Exception('Please enter a URL of a web server to attack.\n'
+            'Example "http://example.com".\n\n'
+            'The text entered "<b>%s</b>" is not a valid URL.' % url_str)
+    else:
+      if url.scheme:
+        raise Exception('URL scheme (http/https/etc.) should not be\n'
+            'specified for the SSL attack. Instead, specify a host:port\n'
+            'combination (e.g. google.com:443)')
+      if url_str.find('/') != -1:
+        raise Exception('URL path (e.g. /test.html) is not used for the\n'
+            'SSL attack. Instead, specify a host:port combination\n'
+            '(e.g. google.com:443)')
+      if url_str.find(':') != -1:
+        host = url_str[:url_str.find(':')]
+        port = url_str[url_str.find(':') + 1:]
+        url = urlparse.urlparse('https://%s:%s/ignored' % (host, port))
+      else:
+        url = urlparse.urlparse('https://%s:%d/ignored' % (url_str, 443))
+
 
     proxy_url = ''
     if proxy_str.strip():
@@ -463,6 +502,7 @@ class GUI(object):
     sp_content_length_randomise = False
     sp_field = ''
     sp_randomise_payload = False
+    sp_ssl_do_reconnect = False
 
     if attack_type == self.ATTACK_TYPE_SLOW_HEADERS:
       sh_use_post = self.slow_headers_use_post_checkbutton.get_active()
@@ -486,6 +526,8 @@ class GUI(object):
             sp_content_length)
     
       sp_field = sp_post_field_entry_str.strip()
+    elif attack_type == self.ATTACK_TYPE_SSL_RENEG:
+      sp_ssl_do_reconnect = self.ssl_reneg_do_reconnect_checkbox.get_active()
 
     # Passed validation so we'll set up our attack_info dict:
     self.attack_info['attack_type'] = attack_type
@@ -502,6 +544,7 @@ class GUI(object):
     self.attack_info['sp_content_length_randomise'] = sp_content_length_randomise
     self.attack_info['sp_field']    = sp_field
     self.attack_info['sp_randomise_payload'] = sp_randomise_payload
+    self.attack_info['sp_ssl_do_reconnect'] = sp_ssl_do_reconnect
 
   def show_error_dialog(self, error):
     error_dlg = gtk.MessageDialog(
@@ -589,6 +632,8 @@ class GUI(object):
         text_buf.insert_with_tags_by_name(tb_iter, line[8:], 'red-bg')
       else:
         text_buf.insert_with_tags_by_name(tb_iter, line[8:] + '\n', 'red-bg')
+    elif line.startswith('NOTIFY:'):
+      text_buf.insert_with_tags_by_name(tb_iter, line[8:] + '\n', 'green-bg')
     else:
       if line.startswith('EVENT_CONNECTED:'):
         text_buf.insert(tb_iter, 'Connected.\n')

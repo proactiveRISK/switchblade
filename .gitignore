@@ -1,0 +1,8 @@
+build
+src/*.swp
+src/HttpDosTool/
+*.swp
+*.o
+*.exe
+*.zip
+.sconsign.dblite

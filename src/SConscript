@@ -14,13 +14,13 @@ def make_version(target, source, env):
       (int(version), int((version - int(version)) * 10)))
   f.close()
 
-env.Append(LIBS=['event'],
+env.Append(LIBS=['event', 'event_openssl', 'event_core', 'ssl', 'crypto'],
            CPPPATH=['.'],
            CXXFLAGS=['-g', '-O1'])
 
 if env['PLATFORM'] == 'win32':
   env.Append(
-      LIBS=['dnsapi', 'ws2_32'],
+      LIBS=['dnsapi', 'ws2_32', 'gdi32'],
       LINKFLAGS=['-static-libgcc', '-static-libstdc++'])
 else:
   env.Append(LIBS=['rt'])
