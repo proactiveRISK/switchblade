@@ -281,7 +281,7 @@ class GUI(object):
     self.window = builder.get_object('main_window')
     self.window.connect('delete-event', gtk.main_quit)
     self.window.set_title(
-        'HTTP attack version %3.1f (slow headers and slow POST)' %
+        'SwitchBlade V%3.1f from ProactiveRISK' %
         self.version)
 
     self.quit_button = builder.get_object('quit_button')
