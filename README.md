@@ -1,4 +1,4 @@
-ddos-toolbox
+SwitchBlade
 ============
 
 Collection of performance testing tools
